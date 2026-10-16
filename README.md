@@ -354,7 +354,7 @@ cp scripts/whitelist_serve /usr/local/bin/ && chmod 755 /usr/local/bin/whitelist
 scp scripts/whitelist_sync root@<新节点>:/usr/local/bin/
 ssh root@<新节点> chmod 755 /usr/local/bin/whitelist_sync
 # ③ 共用受限密钥（所有从节点同一把）：主节点 authorized_keys 追加
-command="/usr/local/bin/whitelist_serve",no-pty,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA... replicas
+command="/usr/local/bin/whitelist_serve",no-pty,no-X11-forwarding,no-agent-forwarding,no-port-forwarding,no-user-rc,from="<从节点IP>" ssh-ed25519 AAAA... replicas
 # ④ 手动跑一次验证 + 与主节点比对，通过后上定时任务
 ssh root@<新节点> MASTER_HOST=<A地址> MASTER_KEY=/root/.ssh/id_ed25519 /usr/local/bin/whitelist_sync
 ssh root@<新节点> "diff <(sort /etc/squid/allowed_domains.list) <(ssh <A> whitelist_serve|sort)"   # 应一致
