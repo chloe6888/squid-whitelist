@@ -16,6 +16,8 @@
   python3 squid_whitelist.py --mock data/mock_records.json   # 本地全路径演练（零副作用）
 """
 
+__version__ = '1.0'
+
 import os
 import sys
 import json
