@@ -447,13 +447,13 @@ def t4_gate(tmp):
     check('E2E: 新增组含全部域名(去重+小写)',
           '新增成功：batch-a.com、batch-b.com、batch-c.com' in concl('e1'), concl('e1'))
     check('E2E: 已存在+IP→部分放通', st('e2') == '部分放通', st('e2'))
-    check('E2E: 部分放通结论四组', '已存在：batch-a.com' in concl('e2')
-          and '不合规：1.2.3.4（IP地址）' in concl('e2'), concl('e2'))
+    check('E2E: 部分放通结论四组', '已在白名单：batch-a.com' in concl('e2')
+          and '域名不合规：1.2.3.4（IP地址）' in concl('e2'), concl('e2'))
     check('E2E: 全不合规→驳回', st('e3') == '驳回'
           and '缺少主域名后缀' in concl('e3') and '请修改后重新提交' in concl('e3'),
           (st('e3'), concl('e3')))
     check('E2E: 仿冒+已存在→部分放通', st('e4') == '部分放通'
-          and '疑似仿冒：aliyum.com' in concl('e4') and '已存在：github.com' in concl('e4'),
+          and '疑似仿冒：aliyum.com' in concl('e4') and '已在白名单：github.com' in concl('e4'),
           (st('e4'), concl('e4')))
     check('E2E: 仿冒结论引导联系管理员', '如确认无误请联系管理员' in concl('e4'))
     check('E2E: 执行失败→人工核查', st('e5') == '人工核查', st('e5'))

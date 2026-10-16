@@ -199,9 +199,9 @@ def build_conclusion(added, existing, invalid, confirm, extra=()):
     if added:
         lines.append('新增成功：' + '、'.join(added))
     if existing:
-        lines.append('已存在：' + '、'.join(existing))
+        lines.append('已在白名单：' + '、'.join(existing))
     if invalid:
-        lines.append('不合规：' + '、'.join('%s（%s）' % pv for pv in invalid))
+        lines.append('域名不合规：' + '、'.join('%s（%s）' % pv for pv in invalid))
     if confirm:
         lines.append('疑似仿冒：' + '、'.join('%s（%s）' % pv for pv in confirm))
     lines.extend(extra)
