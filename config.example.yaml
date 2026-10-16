@@ -1,0 +1,82 @@
+# ============================================================
+# 域名白名单自动审批系统 配置模板（部署于主节点A）
+#
+# 用法：cp config.example.yaml config.yaml 后逐块填写。
+# 真实 config.yaml 含凭证，已在 .gitignore 中排除，不得提交仓库。
+# 凭证类字段（app_*、base_id、sheet_id、operator_id）的获取方法
+# 见 README 4.5 的调试命令（--resolve / --find-operator）。
+#
+# 2026-10-15 架构重构：
+#   - 准入控制：不判断可达性，geo/直连探测/对照实验配置整体删除
+#   - 主从拉取：nodes.remote 删除，从节点由各自 whitelist_sync 拉取镜像
+#     （从节点配置走 whitelist_sync 的环境变量，不在本文件）
+# ============================================================
+
+dingtalk:
+  app_key: "dingxxxxxxxx"
+  app_secret: "your-app-secret"
+  base_id: "your-base-id"          # 表格URL反查：--resolve '<表格完整URL>'
+  sheet_id: "your-sheet-id"
+  operator_id: "your-operator-unionid"  # --find-operator 反查（该用户须为表格协作者）
+  timeout: 15
+  # 字段名（与表格列名一致）
+  status_field: "状态"
+  conclusion_field: "结论"
+  # 状态单选的选项文案（共六项），须与表格选项精确一致。
+  # 待处理=初始；处理中=脚本占住（上轮中断的记录下轮自动回收重跑）；
+  # 已放通/部分放通/驳回=终态；人工核查=仅squid服务侧故障（修复后改回"待处理"重测）
+  status:
+    pending: "待处理"          # 旧写法 dingtalk.status_pending 仍兼容
+    processing: "处理中"
+    approved: "已放通"
+    partial: "部分放通"
+    rejected: "驳回"
+    manual: "人工核查"
+  # 单选字段写入形态已固定为纯字符串（联调锁定：name 形态 {"name":X} 被
+  # 服务端 400 拒绝 "[object Object]"），无配置开关——误配即全量回写失败，
+  # 不留旋钮。结论留档于此与 dingtalk_client.py 头注。
+  # API 地址覆盖：本地联调指向 local_sim/fake_dingtalk.py 时取消注释，生产保持注释
+  # api_base: "http://127.0.0.1:18080"
+  # oapi_base: "http://127.0.0.1:18080"
+
+nodes:
+  local:                        # 主节点A：脚本运行处，集群唯一白名单写入点
+    name: "A"
+    squid_port: 13128
+    squid_conf: /etc/squid/squid.conf   # 零触盘预检用（tmp.conf 派生自它）
+    whitelist: /etc/squid/allowed_domains.list
+
+layer0:
+  # 对照域名：白名单中已有且稳定。任何代理应答(200/502/504)=squid健康；
+  # 403/407/连接失败=不健康→整批跳过（记录原地不动，下轮重试）
+  control_domains:
+    - "www.qq.com"
+    - "www.baidu.com"
+  min_healthy: 1
+  timeout: 8                    # 对照探测超时(秒)
+
+layers:
+  max_per_run: 20               # 每轮处理记录上限（防申请洪水）
+  max_domains_per_record: 20    # 单条记录域名上限（拆分去重后超出截断，结论提示分批）
+  dns_check: true               # 待新增域名须可解析（节点本地=与squid同环境，解析不出=死条目→驳回）
+  dns_timeout: 3                # 单次解析限时(秒)；失败自动重试1次抗抖动
+
+execution:
+  auto: true                    # true=全自动落盘+reload | false=仅判定回写不执行
+  # 写入形态——squid 6.14 实测锁定 dot_prefix：dstdomain 裸条目(baidu.com)仅精确
+  # 匹配，子域(www.)不放行；点前缀(.baidu.com)才覆盖裸域+全部子域
+  store_format: dot_prefix
+  backup_keep: 20               # 保留的备份份数
+  squid_cmd: "squid"
+  proxy_auth: "user:password"   # 本机 squid basic 认证（层0/复测带 Proxy-Authorization 头）。
+                                # 无认证的主节点留空 ''
+  proxy_tls: true               # 本机 squid 为 https_port 13128（TLS封装代理口）→ 探测
+                                # 用 ssl 封装 CONNECT（自签证书不校验）。明文 http_port 则 false
+
+paths:
+  known_domains: data/known_domains.txt   # 相似度检测的知名种子（人工维护）
+  audit_log: data/audit.jsonl
+  audit_max_mb: 16              # 审计超限自动轮转阈值（-> audit.jsonl.rot.<ts>）
+  audit_keep: 3                 # 轮转保留份数
+  heartbeat: data/heartbeat
+  lock_file: /tmp/squid_whitelist.lock

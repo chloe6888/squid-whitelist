@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""whitelist_sync —— 从节点白名单同步 agent（部署于每个从节点，cron */2 拉取）
+
+主节点是白名单唯一权威；本脚本将主节点清单全量镜像到本机：
+  SSH 拉取(whitelist_serve) → 归一化比对（域名集合 + 点前缀形态）→
+  无变化零动作（不写盘不reload）；有变化 → 零触盘预检(squid -f tmp.conf
+  -k parse，坏内容拒收不落地) → 备份 → 原子替换 → reconfigure
+  （严禁 restart：秒级空窗+断流）。失败恢复备份，本地始终保持最后good版本。
+  条目形态原样保留：裸条目=仅精确匹配，点前缀=裸域+全部子域（squid 6.14
+  实测），主从语义不漂移。flock 防重叠（ssh 90s+parse 30s 可能超 cron 周期）。
+
+全量镜像语义：主删从删；本机手工改动会被下次同步覆盖（特性：增删改只在
+主节点做一处）。同步链路不经过 http_access → 本机 squid 有无 basic auth、
+TLS 与否均可（与主节点混布）。
+
+每次运行输出一行日志（cron 重定向到 /var/log/whitelist_sync.log，
+日志即心跳：末行时间戳过旧 = 同步没在跑，人工看一眼即可，不上watchdog）。
+
+自包含仅标准库。环境变量（均可覆盖）：
+  MASTER_HOST   必填，主节点地址
+  MASTER_PORT   22          MASTER_USER  root
+  MASTER_KEY    /root/.ssh/id_ed25519（受限密钥，所有从节点共用一把）
+  WHITELIST     /etc/squid/allowed_domains.list
+  SQUID_CONF    /etc/squid/squid.conf
+  SQUID_BIN     squid       BACKUP_KEEP 10       SSH_TIMEOUT 10
+  SYNC_FETCH_CMD  测试钩子：替代SSH拉取的本地命令（sim_test 用，生产勿设）
+
+用法：whitelist_sync [--selftest]
+  --selftest 验证 parse 防线本身：原conf应通过、坏conf应被拒。
+"""
+
+import fcntl
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def _env(key, default):
+    return os.environ.get(key, default)
+
+
+WHITELIST = Path(_env('WHITELIST', '/etc/squid/allowed_domains.list'))
+SQUID_CONF = Path(_env('SQUID_CONF', '/etc/squid/squid.conf'))
+SQUID_BIN = _env('SQUID_BIN', 'squid')
+BACKUP_KEEP = int(_env('BACKUP_KEEP', '10'))
+
+
+def log(action, detail=''):
+    print('%s %s %s' % (time.strftime('%Y-%m-%d %H:%M:%S'), action, detail))
+
+
+def fetch_master():
+    """拉取主节点标准清单 -> (rc, stdout, stderr)。"""
+    override = _env('SYNC_FETCH_CMD', '')
+    if override:
+        p = subprocess.run(override, shell=True, capture_output=True,
+                           text=True, timeout=30)
+        return p.returncode, p.stdout, p.stderr
+    cmd = ['ssh', '-p', _env('MASTER_PORT', '22'),
+           '-o', 'BatchMode=yes',
+           '-o', 'ConnectTimeout=%s' % _env('SSH_TIMEOUT', '10'),
+           '-i', _env('MASTER_KEY', '/root/.ssh/id_ed25519'),
+           '%s@%s' % (_env('MASTER_USER', 'root'), _env('MASTER_HOST', '')),
+           'whitelist_serve']
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, '', 'ssh timeout'
+
+
+def parse_rules(text):
+    """清单文本 -> {归一化域名: 是否点前缀}。
+
+    键（去前导点/小写/忽略注释）用于比对成员变化；值保留写入形态——
+    裸条目=仅精确匹配，点前缀=裸域+全部子域。形态也参与比对与写入，
+    保证主从 ACL 语义一致（写侧不静默加宽裸条目）。
+    """
+    out = {}
+    for line in (text or '').splitlines():
+        raw = line.strip().lower()
+        if raw and not raw.startswith('#'):
+            out[raw.lstrip('.')] = raw.startswith('.')
+    return out
+
+
+def acquire_lock():
+    """flock 防重叠（与主节点 squid_whitelist 同一防并发策略）：
+    上一轮未结束时本轮直接退出，避免两轮并发写同一 .sync-tmp。"""
+    f = open(WHITELIST.with_name(WHITELIST.name + '.sync-lock'), 'w')
+    try:
+        fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except OSError:
+        log('busy', '上一轮同步仍在运行，本轮退出')
+        f.close()
+        return None
+
+
+def squid(args, timeout=30):
+    """执行 squid 命令 -> (rc, 输出摘要)。SQUID_BIN 可为带参数的完整命令。"""
+    import shlex
+    try:
+        p = subprocess.run(shlex.split(SQUID_BIN) + args, capture_output=True,
+                           text=True, timeout=timeout)
+        return p.returncode, ((p.stdout or '') + (p.stderr or '')).strip()[:300]
+    except subprocess.TimeoutExpired:
+        return 124, 'squid命令超时'
+
+
+def _write_tmp_conf(tmp_conf, tmp_wl):
+    """由正式 conf 派生临时 conf（仅替换白名单路径）。失败返回原因或 None。"""
+    conf_text = SQUID_CONF.read_text(encoding='utf-8')
+    if str(WHITELIST) not in conf_text:
+        return 'squid.conf(%s) 未引用白名单路径 %s' % (SQUID_CONF, WHITELIST)
+    tmp_conf.write_text(conf_text.replace(str(WHITELIST), str(tmp_wl)),
+                        encoding='utf-8')
+    return None
+
+
+def _backup():
+    ts = time.strftime('%Y%m%d-%H%M%S')
+    bak = WHITELIST.with_name('%s.bak.%s' % (WHITELIST.name, ts))
+    shutil.copy2(WHITELIST, bak)
+    baks = sorted(WHITELIST.parent.glob(WHITELIST.name + '.bak.*'))
+    for old in (baks[:-BACKUP_KEEP] if BACKUP_KEEP else []):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return bak
+
+
+def sync_once():
+    remote_rc, remote_out, remote_err = fetch_master()
+    if remote_rc != 0:
+        log('master-unreachable', 'rc=%s %s' % (remote_rc, (remote_err or '').strip()[:120]))
+        return 1
+    remote = parse_rules(remote_out)
+    try:
+        local = parse_rules(WHITELIST.read_text(encoding='utf-8'))
+    except OSError as e:
+        log('error', '读取本地白名单失败: %s' % e)
+        return 1
+    if remote == local:
+        log('synced', 'no-op %d rules' % len(local))
+        return 0
+
+    tmp_wl = WHITELIST.with_name(WHITELIST.name + '.sync-tmp')
+    tmp_conf = SQUID_CONF.with_name(SQUID_CONF.name + '.sync-tmp')
+    try:
+        # 零触盘预检：squid 自己 parse 裁决，正式文件不被碰。
+        # 形态原样镜像（裸=精确匹配 / 点前缀=含子域），不静默加宽
+        tmp_wl.write_text(''.join((('.' + d) if remote[d] else d) + '\n'
+                                  for d in sorted(remote)),
+                          encoding='utf-8')
+        err = _write_tmp_conf(tmp_conf, tmp_wl)
+        if err:
+            log('error', err)
+            return 1
+        rc, out = squid(['-f', str(tmp_conf), '-k', 'parse'])
+        if rc != 0:
+            # 主节点内容有问题（或与本机组合有冲突）：拒收，保持最后good版本
+            log('rejected', '预检parse失败，保持本地不变 %s' % out[:120])
+            return 1
+        bak = _backup()
+        tmp_wl.replace(WHITELIST)
+        rc, out = squid(['-k', 'reconfigure'])
+        if rc != 0:
+            time.sleep(0.5)
+            rc, out = squid(['-k', 'reconfigure'])
+        if rc != 0:
+            try:
+                bak.replace(WHITELIST)
+            except OSError as e:
+                log('error', 'reconfigure失败且回滚失败(备份保留): %s %s' % (out[:120], e))
+                return 1
+            squid(['-k', 'reconfigure'])
+            log('failed', 'reconfigure失败已回滚 %s' % out[:120])
+            return 1
+        log('updated', '+%d -%d -> %d rules'
+            % (len(set(remote) - set(local)), len(set(local) - set(remote)),
+               len(remote)))
+        return 0
+    finally:
+        for p in (tmp_wl, tmp_conf):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def selftest():
+    """验证 parse 防线本身：原conf应通过、注入坏指令的conf应被拒。"""
+    tmp_wl = WHITELIST.with_name(WHITELIST.name + '.selftest')
+    tmp_ok = SQUID_CONF.with_name(SQUID_CONF.name + '.selftest-ok')
+    tmp_bad = SQUID_CONF.with_name(SQUID_CONF.name + '.selftest-bad')
+    try:
+        tmp_wl.write_text(WHITELIST.read_text(encoding='utf-8'), encoding='utf-8')
+        err = _write_tmp_conf(tmp_ok, tmp_wl)
+        if err:
+            log('selftest', 'FAIL %s' % err)
+            return 1
+        tmp_bad.write_text(tmp_ok.read_text(encoding='utf-8')
+                           + '\nTHIS-IS-NOT-A-DIRECTIVE !!!\n', encoding='utf-8')
+        rc_ok, _ = squid(['-f', str(tmp_ok), '-k', 'parse'])
+        rc_bad, _ = squid(['-f', str(tmp_bad), '-k', 'parse'])
+        if rc_ok == 0 and rc_bad != 0:
+            log('selftest', 'ok（原conf通过，坏conf被拒，parse防线有效）')
+            return 0
+        log('selftest', 'FAIL rc_ok=%s rc_bad=%s（parse防线不可靠，勿启用同步）'
+            % (rc_ok, rc_bad))
+        return 1
+    finally:
+        for p in (tmp_wl, tmp_ok, tmp_bad):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--selftest':
+        return selftest()
+    if len(sys.argv) != 1:
+        sys.stderr.write('usage: whitelist_sync [--selftest]\n')
+        return 2
+    lock = acquire_lock()
+    if lock is None:
+        return 0
+    try:
+        return sync_once()
+    except Exception as e:  # 任何意外都保持本地不变，日志一行可查
+        log('error', '%s: %s' % (type(e).__name__, e))
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,21 @@
+# 真实配置（含钉钉凭证/节点IP/代理密码）——仓库只带 config.example.yaml
+config.yaml
+
+# 运行时产物（生产数据，随部署机走，不进仓库）
+data/audit.jsonl*
+data/heartbeat
+
+# 白名单事务备份（正常在 /etc/squid/，防止误拷进仓库）
+*.bak.*
+*.tmp
+*.txn
+*.sync-tmp
+*.selftest*
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地工具会话目录
+.claude/
+.zcode/

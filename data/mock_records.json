@@ -1,0 +1,106 @@
+{
+  "layer0": {"ok": true},
+  "whitelist": ["github.com", "www.python.org", "www.superset-demo.com"],
+  "exec_fail": ["exec-fail-demo.com"],
+  "records": [
+    {
+      "recordId": "mock-001",
+      "flat": {
+        "域名": "https://research-data.example.org/dataset，mirrors.example.org; FTP.EXAMPLE.net",
+        "申请人": "张三",
+        "访问用途": "下载科研数据（多域名混合分隔符/协议头/路径/大小写）",
+        "申请日期": "2026-10-15 09:47",
+        "状态": "待处理",
+        "结论": ""
+      }
+    },
+    {
+      "recordId": "mock-002",
+      "flat": {
+        "域名": "research-data.example.org, 1.2.3.4, shortname",
+        "申请人": "张三",
+        "访问用途": "部分成功：1个已存在+IP+缺后缀",
+        "申请日期": "2026-10-15 09:52",
+        "状态": "待处理",
+        "结论": ""
+      }
+    },
+    {
+      "recordId": "mock-003",
+      "flat": {
+        "域名": "xy com，xn--55qx5d.cn，bad_domain!!.com",
+        "申请人": "李工",
+        "访问用途": "全部不合规（含空格拆分后缺后缀/IDN/非法字符）→驳回",
+        "申请日期": "2026-10-15 10:01",
+        "状态": "待处理",
+        "结论": ""
+      }
+    },
+    {
+      "recordId": "mock-004",
+      "flat": {
+        "域名": "[aliyum.com](https://aliyum.com), github.com",
+        "申请人": "王五",
+        "访问用途": "疑似仿冒+已存在 → 部分放通（仿冒确认闭环演练）",
+        "申请日期": "2026-10-15 10:05",
+        "状态": "待处理",
+        "结论": ""
+      }
+    },
+    {
+      "recordId": "mock-005",
+      "flat": {
+        "域名": "exec-fail-demo.com, ok-after-fail.com",
+        "申请人": "张三",
+        "访问用途": "执行环节演练失败（squid服务侧）→ 人工核查",
+        "申请日期": "2026-10-15 10:10",
+        "状态": "待处理",
+        "结论": ""
+      }
+    },
+    {
+      "recordId": "mock-006",
+      "flat": {
+        "域名": "recycle-demo.com",
+        "申请人": "李工",
+        "访问用途": "上轮中断记录（处理中）→ 本轮自动回收重跑",
+        "申请日期": "2026-10-15 10:15",
+        "状态": "处理中",
+        "结论": ""
+      }
+    },
+    {
+      "recordId": "mock-007",
+      "flat": {
+        "域名": "superset-demo.com",
+        "申请人": "王五",
+        "访问用途": "白名单已有 www.superset-demo.com → 超集冲突待确认 → 驳回",
+        "申请日期": "2026-10-15 10:20",
+        "状态": "待处理",
+        "结论": ""
+      }
+    },
+    {
+      "recordId": "mock-008",
+      "flat": {
+        "域名": "n01.com, n02.com, n03.com, n04.com, n05.com, n06.com, n07.com, n08.com, n09.com, n10.com, n11.com, n12.com, n13.com, n14.com, n15.com, n16.com, n17.com, n18.com, n19.com, n20.com, n21.com, n22.com, n23.com",
+        "申请人": "张三",
+        "访问用途": "23个域名超上限20 → 截断+分批提示",
+        "申请日期": "2026-10-15 10:25",
+        "状态": "待处理",
+        "结论": ""
+      }
+    },
+    {
+      "recordId": "mock-009",
+      "flat": {
+        "域名": "",
+        "申请人": "王五",
+        "访问用途": "空域名 → 驳回提示重新填写",
+        "申请日期": "2026-10-15 10:30",
+        "状态": "待处理",
+        "结论": ""
+      }
+    }
+  ]
+}

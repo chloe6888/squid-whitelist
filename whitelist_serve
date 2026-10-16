@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""whitelist_serve —— 主节点白名单只读输出（部署于主节点 /usr/local/bin/）
+
+配合 authorized_keys 的 command= 强制调用，供从节点 whitelist_sync 拉取：
+  command="/usr/local/bin/whitelist_serve",no-pty,no-X11-forwarding,no-agent-forwarding \
+          ssh-ed25519 AAAA... replicas
+
+零参数、零输入：输出归一化清单（每行一条、小写、去空白），**保留每条的
+点前缀形态**——裸条目=仅精确匹配，点前缀=裸域+全部子域（squid 6.14 实测）。
+若对裸条目强制加点，主节点按精确匹配、从节点按全子域放行，同一规则两边
+语义漂移，故绝不静默加宽；发现裸条目时向 stderr 告警提示补点（不阻断）。
+从节点与本地清单做集合比对。受限密钥即使泄露，最大损失仅为"清单可读"。
+
+自包含仅标准库。环境变量 WHITELIST_SERVE_PATH 可覆盖清单路径（测试用）。
+"""
+
+import os
+import sys
+
+WHITELIST = os.environ.get('WHITELIST_SERVE_PATH',
+                           '/etc/squid/allowed_domains.list')
+
+
+def main():
+    if len(sys.argv) != 1:
+        sys.stderr.write('usage: whitelist_serve（零参数，不接受任何输入）\n')
+        return 2
+    try:
+        text = open(WHITELIST, encoding='utf-8').read()
+    except OSError as e:
+        sys.stderr.write('read %s failed: %s\n' % (WHITELIST, e))
+        return 1
+    for line in text.splitlines():
+        d = line.strip().lower()
+        if d and not d.startswith('#'):
+            if not d.startswith('.'):
+                sys.stderr.write('warning: 裸条目 %s 按精确匹配语义原样输出'
+                                 '（点前缀 .%s 才覆盖全部子域）\n' % (d, d))
+            print(d)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
