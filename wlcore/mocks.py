@@ -13,7 +13,7 @@ mock_whitelist  mock 白名单来源：list → 原样；"real" → 只读主节
 import logging
 from pathlib import Path
 
-from layers import parse_whitelist_text, plan_merge
+from wlcore.layers import parse_whitelist_text, plan_merge
 
 log = logging.getLogger("squid_whitelist")
 

@@ -29,10 +29,10 @@ from datetime import datetime
 
 import yaml
 
-from layers import (split_domains, validate_format, is_idn, check_similar,
+from wlcore.layers import (split_domains, validate_format, is_idn, check_similar,
                     registrable, plan_merge, load_domain_list)
-from netprobe import connect_check, resolve_ok
-from executor import NodeA
+from wlcore.netprobe import connect_check, resolve_ok
+from wlcore.executor import NodeA
 
 log = logging.getLogger("squid_whitelist")
 
@@ -431,18 +431,18 @@ def main():
     # ---- 组件装配 ----
     known_seeds = load_domain_list(paths.get('known_domains', 'data/known_domains.txt'))
     if mock is not None:
-        from mocks import MockNode, MockTable, mock_whitelist
+        from wlcore.mocks import MockNode, MockTable, mock_whitelist
         node = MockNode(mock_whitelist(mock.get('whitelist'),
                                        cfg['nodes']['local'].get('whitelist')),
                         audit, mock.get('exec_fail') or [])
         if mock.get('table') == 'real':
-            from dingtalk_client import DingTalkTable
+            from wlcore.dingtalk_client import DingTalkTable
             table = DingTalkTable(cfg['dingtalk'])
         else:
             table = MockTable(mock)
     else:
         node = NodeA(cfg, audit)
-        from dingtalk_client import DingTalkTable
+        from wlcore.dingtalk_client import DingTalkTable
         table = DingTalkTable(cfg['dingtalk'])
 
     # ---- 拉取 待处理 + 处理中（上轮中断回收：写入幂等，重跑无副作用） ----

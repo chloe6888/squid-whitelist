@@ -23,8 +23,8 @@ import subprocess
 import time
 from pathlib import Path
 
-from layers import parse_whitelist_text, plan_merge
-from netprobe import connect_check, wait_proxy_ready
+from wlcore.layers import parse_whitelist_text, plan_merge
+from wlcore.netprobe import connect_check, wait_proxy_ready
 
 log = logging.getLogger("executor")
 

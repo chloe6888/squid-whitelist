@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dingtalk_client import DingTalkTable, flatten_value      # noqa: E402
+from wlcore.dingtalk_client import DingTalkTable, flatten_value      # noqa: E402
 from fake_dingtalk import FakeDingtalk                        # noqa: E402
 
 PASS = FAIL = 0
@@ -268,7 +268,7 @@ def t7_cli():
 
             def run(*extra):
                 return subprocess.run(
-                    [sys.executable, str(REPO / 'dingtalk_client.py'),
+                    [sys.executable, str(REPO / 'wlcore' / 'dingtalk_client.py'),
                      '--config', str(cfgp), *extra],
                     capture_output=True, text=True, timeout=60)
 

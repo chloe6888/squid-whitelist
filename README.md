@@ -34,7 +34,7 @@
 pip3 install -r requirements.txt                      # ① 依赖：requests + PyYAML（仅主节点）
 # ② 主节点 squid 初始化（证书/ACL 骨架，见 4.2，认证有无均可）
 # ③ 填写 config.yaml（base_id/operator_id 用 4.5 调试命令反查）
-python3 dingtalk_client.py --config config.yaml --check    # ④ 验证钉钉连通（只读）
+python3 wlcore/dingtalk_client.py --config config.yaml --check    # ④ 验证钉钉连通（只读）
 python3 squid_whitelist.py --config config.yaml --dry-run      # ⑤ 判定演练（零写入）
 # ⑥ 表格状态单选加"处理中""部分放通"两选项 → 按 4.7 两阶段上 cron
 # ⑦ 从节点按 4.6 四步部署（可后做，不影响主节点运行）
@@ -81,17 +81,18 @@ python3 squid_whitelist.py --config config.yaml --dry-run      # ⑤ 判定演�
 
 ```
 squid-whitelist/                     # 主节点A
-├── config.yaml                 # 真实配置（含凭证，gitignore；模板 config.example.yaml）
-├── config.example.yaml
 ├── squid_whitelist.py          # 主入口：层0+批内循环（拆分→分流→执行→回写）
-├── dingtalk_client.py          # 钉钉表格读记录+回写，附调试命令
-├── layers.py                   # 拆分/格式/IDN/相似度/覆盖判定/合并计划（纯逻辑，可单测）
-├── netprobe.py                 # CONNECT 原语 + 端口就绪等待 + DNS解析原语（层0/复测/DNS准入）
-├── executor.py                 # 执行环节：批量原子事务（仅主节点本机）
-├── mocks.py                    # 演练测试替身（--mock 路径，不进生产链路）
-├── whitelist_serve             # 部署于主节点：供从节点拉取的只读清单输出
-├── whitelist_sync              # 部署于每个从节点：拉取→比对→预检→镜像→reconfigure
-├── test_layers.py              # 拆分/格式/相似度/覆盖 单测
+├── wlcore/                     # 核心包（主入口依赖）
+│   ├── layers.py               #   拆分/格式/IDN/相似度/覆盖判定/合并计划（纯逻辑，可单测）
+│   ├── netprobe.py             #   CONNECT 原语 + 端口就绪等待 + DNS解析原语（层0/复测/DNS准入）
+│   ├── executor.py             #   执行环节：批量原子事务（仅主节点本机）
+│   ├── dingtalk_client.py      #   钉钉表格读记录+回写，附调试命令
+│   └── mocks.py                #   演练测试替身（--mock 路径，不进生产链路）
+├── scripts/                    # 独立部署件（自包含仅标准库，不依赖 wlcore）
+│   ├── whitelist_serve         #   部署于主节点 /usr/local/bin：供从节点拉取的只读清单输出
+│   └── whitelist_sync          #   部署于每个从节点 /usr/local/bin：拉取→比对→预检→镜像→reconfigure
+├── tests/
+│   └── test_layers.py          # 拆分/格式/相似度/覆盖 单测
 ├── local_sim/                  # 测试基建（无 squid/SSH/钉钉环境验证全链路）
 │   ├── fake_proxy.py           #   模拟squid的CONNECT代理
 │   ├── fake_squid.sh           #   squid命令桩（SQUID_FAIL_AT=N 注入第N次失败）
@@ -103,13 +104,10 @@ squid-whitelist/                     # 主节点A
 │   ├── audit.jsonl             # 审计日志（运行时生成）
 │   ├── heartbeat               # 心跳文件（运行时生成）
 │   └── mock_records.json       # 演练数据
+├── config.yaml                 # 真实配置（含凭证，gitignore；模板 config.example.yaml）
+├── config.example.yaml
 ├── requirements.txt            # requests, PyYAML（从节点零依赖）
 └── .gitignore
-
-每个从节点：
-└── /usr/local/bin/whitelist_sync   # 自包含仅标准库；环境变量覆盖配置
-主节点：
-└── /usr/local/bin/whitelist_serve
 ```
 
 ### 1.3 核心组件与数据流
@@ -352,7 +350,7 @@ rsync -av --exclude='data/audit.jsonl' --exclude='data/heartbeat' \
   --exclude='__pycache__' <源机>:~/squid-whitelist/ /opt/squid-whitelist/
 cd /opt/squid-whitelist && pip3 install -r requirements.txt
 cp config.example.yaml config.yaml    # 逐块填写（凭证反查见 4.5）
-cp whitelist_serve /usr/local/bin/ && chmod 755 /usr/local/bin/whitelist_serve
+cp scripts/whitelist_serve /usr/local/bin/ && chmod 755 /usr/local/bin/whitelist_serve
 ```
 
 ### 4.4 数据文件
@@ -362,9 +360,9 @@ cp whitelist_serve /usr/local/bin/ && chmod 755 /usr/local/bin/whitelist_serve
 ### 4.5 验证钉钉连通
 
 ```bash
-python3 dingtalk_client.py --config config.yaml --resolve '<表格完整URL>'
-python3 dingtalk_client.py --config config.yaml --find-operator
-python3 dingtalk_client.py --config config.yaml --check
+python3 wlcore/dingtalk_client.py --config config.yaml --resolve '<表格完整URL>'
+python3 wlcore/dingtalk_client.py --config config.yaml --find-operator
+python3 wlcore/dingtalk_client.py --config config.yaml --check
 python3 squid_whitelist.py --config config.yaml --dry-run
 ```
 
@@ -373,7 +371,7 @@ python3 squid_whitelist.py --config config.yaml --dry-run
 ```bash
 # ① 新节点按 4.2 初始化 squid（模板A/B 任选），白名单留空（首次sync自动镜像）
 # ② 部署同步agent
-scp whitelist_sync root@<新节点>:/usr/local/bin/
+scp scripts/whitelist_sync root@<新节点>:/usr/local/bin/
 ssh root@<新节点> chmod 755 /usr/local/bin/whitelist_sync
 # ③ 共用受限密钥（所有从节点同一把）：主节点 authorized_keys 追加
 command="/usr/local/bin/whitelist_serve",no-pty,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA... replicas
@@ -414,7 +412,7 @@ ssh root@<新节点> "diff <(sort /etc/squid/allowed_domains.list) <(ssh <A> whi
 
 | 命令 | 覆盖内容 |
 |---|---|
-| `python3 test_layers.py` | 拆分（容错/Markdown/端口/去重/截断）、格式、IDN、相似度（含短域相对阈值）、覆盖方向性、合并计划 plan_merge（覆盖/批内/超集吸收）、清单文件加载 |
+| `python3 tests/test_layers.py` | 拆分（容错/Markdown/端口/去重/截断）、格式、IDN、相似度（含短域相对阈值）、覆盖方向性、合并计划 plan_merge（覆盖/批内/超集吸收）、清单文件加载 |
 | `python3 local_sim/sim_test.py` | 全链路：批量事务（成功/预检零触盘/回滚/超集吸收/批内吸收）、DNS 准入 E2E、whitelist_sync 子进程真跑（no-op/更新/拒收/master不可达/**形态保真不加点加宽**/**flock 防重叠**/selftest）、serve 输出保真、E2E 多域名六态全出口、处理中回收 |
 | `python3 local_sim/test_dingtalk.py` | 钉钉客户端：token/映射/翻页/多状态过滤/text写入闭环 |
 | `python3 squid_whitelist.py --mock data/mock_records.json` | mock 全路径演练：六态全出口零副作用 |
@@ -555,4 +553,3 @@ ssh root@<新节点> "diff <(sort /etc/squid/allowed_domains.list) <(ssh <A> whi
 
 ---
 
-以上为新版 README 全文。审阅通过后我按第四~五章落地实施。

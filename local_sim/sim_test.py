@@ -31,8 +31,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from netprobe import connect_check, resolve_ok                       # noqa: E402
-from executor import NodeA                                           # noqa: E402
+from wlcore.netprobe import connect_check, resolve_ok                       # noqa: E402
+from wlcore.executor import NodeA                                           # noqa: E402
 from squid_whitelist import Audit                                    # noqa: E402
 from fake_proxy import FakeSquidProxy                                # noqa: E402
 
@@ -196,7 +196,7 @@ def t2_add_batch(tmp, wl_shared):
 
 def t3_whitelist_sync(tmp):
     print('== T3 whitelist_sync（子进程真跑，SYNC_FETCH_CMD替代SSH） ==')
-    sync = str(REPO / 'whitelist_sync')
+    sync = str(REPO / 'scripts' / 'whitelist_sync')
 
     def run_sync(d, fixture=None, fail_at=0, fail_from=0, fetch_cmd=None, args=()):
         d.mkdir(parents=True, exist_ok=True)
@@ -296,7 +296,7 @@ def t3_whitelist_sync(tmp):
     sd = tmp / 'serve_check'
     sd.mkdir()
     (sd / 'wl').write_text('# comment\nBare.Com\n.dotted.com\n\n', encoding='utf-8')
-    p = subprocess.run([sys.executable, str(REPO / 'whitelist_serve')],
+    p = subprocess.run([sys.executable, str(REPO / 'scripts' / 'whitelist_serve')],
                        env=dict(os.environ, WHITELIST_SERVE_PATH=str(sd / 'wl')),
                        capture_output=True, text=True, timeout=30)
     check('serve: 裸条目原样输出不加点(小写归一)',

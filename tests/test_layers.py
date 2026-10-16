@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""拆分/格式/相似度/覆盖 纯逻辑单测：python3 test_layers.py（无依赖、不触网）"""
+"""拆分/格式/相似度/覆盖 纯逻辑单测：python3 tests/test_layers.py（无依赖、不触网）"""
 
 import sys
+from pathlib import Path
 
-from layers import (normalize_domain, split_domains, validate_format, is_idn,
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from wlcore.layers import (normalize_domain, split_domains, validate_format, is_idn,
                     confusable_normalize, damerau_levenshtein, check_similar,
                     distance_threshold, is_covered, plan_merge,
                     parse_whitelist_text, load_domain_list)
