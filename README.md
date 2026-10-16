@@ -7,7 +7,7 @@
 | | 主节点 A | 从节点 B / C / …（可任意扩容） |
 |---|---|---|
 | 职责 | 审批 + 白名单**唯一写入点** | 白名单**只读镜像**（人工改动会被下次同步覆盖） |
-| 定时 | cron */1 + flock 防重叠，每轮 ≤ `max_per_run=20` 条记录 | cron */2 全量拉取镜像 |
+| 定时 | cron */1 + flock 防重叠，每轮 ≤ `max_per_run=20` 条记录 | cron */5 全量拉取镜像 |
 | 依赖 | Python ≥3.8 · requests + PyYAML · squid ≥5 | 仅 Python 标准库 · squid ≥5（有无 auth/TLS 均可） |
 
 **设计原则**：
@@ -17,7 +17,7 @@
 - **批量原子**：一条记录的全部新增域名合并为一次事务，全成或全败
 - **故障隔离**：squid 异常在层0整批拦截，记录原地保留待重试
 
-**同步与生效**：全量镜像，主节点写入后约 1~2 分钟内全网一致（容忍 10 分钟）。
+**同步与生效**：全量镜像，主节点写入后约 5 分钟内全网一致（最长一个同步周期）。
 实测环境：Ubuntu 24.04 · Python 3.12 · squid 6.14 · 主从多节点。
 
 **回写效果示例**（结论四组格式，面向申请人）：
@@ -74,7 +74,7 @@ python3 squid_whitelist.py --config config.yaml --dry-run      # ⑤ 判定演�
 ┌───────┴────────────┐   SSH 只读拉取    ┌─────────────────────┐
 │  主节点 A（唯一写入点）│ ◄────────────── │  从节点 B / C / D …  │
 │  squid_whitelist    │  whitelist_serve │  whitelist_sync     │
-│  (cron */1 + flock) │  (forced command │  (cron */2)         │
+│  (cron */1 + flock) │  (forced command │  (cron */5)         │
 │    ↓ 只写本机白名单   │   零参数只读)     │    ↓ 全量镜像        │
 │  squid :13128       │                 │  squid :13128       │
 │  allowed_domains.list│                │  allowed_domains.list│
@@ -224,7 +224,7 @@ cron 触发（*/1，flock 防重叠）
 两台以上代理节点各自有白名单文件，**只有主节点被审批脚本写入**；从节点用拉取保持镜像：
 
 ```
-主节点A                                    从节点B/C/D（各自每2分钟）
+主节点A                                    从节点B/C/D（各自每5分钟）
   │
   │ ① whitelist_sync 发起 SSH ──────▶ 连得上 = 拉取
   │ ② whitelist_serve 输出
@@ -245,7 +245,7 @@ cron 触发（*/1，flock 防重叠）
 | 全量镜像 | 从节点白名单 = 主节点完整拷贝：**主删从删**；从节点上手工加的条目会被覆盖回主节点版本——这是特性，强制“删除/修改只在主节点一处做” |
 | 语义保真 | 条目**点前缀形态原样镜像**：裸条目=仅精确匹配，点前缀=裸域+全部子域（squid 6.14 实测）。不静默加宽裸条目——否则主节点按精确匹配、从节点按全子域放行，同一规则两边行为漂移。serve 遇裸条目向 stderr 告警提示补点 |
 | 单写者 | 分叉无从产生；主节点文件即使被改坏，从节点预检拒收，坏内容不扩散 |
-| 防重叠 | flock（`allowed_domains.list.sync-lock`）：ssh 90s + parse 30s 可能超出 cron */2 周期，上一轮未结束本轮直接 busy 退出，不并发写同一 tmp 文件 |
+| 防重叠 | flock（`allowed_domains.list.sync-lock`）：上一轮未结束（ssh/parse 慢场景）本轮直接 busy 退出，不并发写同一 tmp 文件 |
 | 幂等 | 每次运行先比对（域名集合+形态），无变化零动作（不写盘不 reload） |
 | 生效方式 | `squid -k reconfigure` 平滑重载（端口重绑窗口实测仅 30~50ms，不断活跃连接）。**严禁 restart**（秒级空窗+全量断流） |
 | 依赖 | 同步链路不经过 squid 的 http_access：从节点**有无 basic auth、TLS 与否均可混布**，sync 零感知 |
@@ -381,7 +381,7 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 **定时任务（同步）**：
 
 ```bash
-*/2 * * * * root MASTER_HOST=<A地址> MASTER_KEY=/root/.ssh/id_ed25519 /usr/local/bin/whitelist_sync >> /var/log/whitelist_sync.log 2>&1
+*/5 * * * * root MASTER_HOST=<A地址> MASTER_KEY=/root/.ssh/id_ed25519 /usr/local/bin/whitelist_sync >> /var/log/whitelist_sync.log 2>&1
 ```
 
 日志一行制（日志即心跳）：每次运行追加一行，静默落后时看最后一行时间戳即知（排查见 6.2）。
@@ -431,11 +431,11 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 | 从节点不生效 | `/var/log/whitelist_sync.log` 最后一行 | master-unreachable→SSH/密钥；rejected→主节点文件被改坏；busy→上一轮卡住（查ssh/parse耗时）；时间戳过旧→cron没跑 |
 | 从节点白名单与主不一致 | diff 两边 | 手动跑一次 sync；确认无人工单边改动（会被自动覆盖，若被绕过说明 sync 没在跑） |
 | 手工验证代理放行（任一节点） | `curl --proxy-insecure -x https://user:pass@127.0.0.1:13128 -sI https://域名/ -o /dev/null -w '%{http_code}\n'`（无 auth/TLS 节点改 `-x http://...`） | 200=放行；403=不在白名单；其余=出口/站点问题 |
-| 申请已放通但用户不通 | 白名单已含 → 站点封该节点出口 IP 或用户节点未同步（1~2分钟窗口） | 等同步窗口；持续不通=站点对出口IP的封锁，非白名单问题，考虑换出口 |
+| 申请已放通但用户不通 | 白名单已含 → 站点封该节点出口 IP 或用户节点未同步（≤5分钟窗口） | 等同步窗口；持续不通=站点对出口IP的封锁，非白名单问题，考虑换出口 |
 
 ### 6.3 人工改动白名单的正确步骤
 
-1. **只改主节点**——增删都只动 A 的 `/etc/squid/allowed_domains.list`，从节点 1~2 分钟内自动镜像（含删除）
+1. **只改主节点**——增删都只动 A 的 `/etc/squid/allowed_domains.list`，从节点 5 分钟内自动镜像（含删除）
 2. 新增条目**统一带点前缀**（`.example.com`）：点前缀=裸域+全部子域；裸条目仅精确匹配且会在 serve 拉取时 stderr 告警（系统不再替你加宽语义）
 3. 改后 `squid -k parse` 校验 → `squid -k reconfigure` 生效。**不要 restart**
 4. 在从节点手工加条目会被下次 sync 覆盖——**从节点文件视为只读缓存**
@@ -453,7 +453,7 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 
 ### 7.1 已知边界
 
-- “已放通”指主节点已生效，从节点最长一个同步周期（*/2 ≈ 1~2 分钟）后生效
+- “已放通”指主节点已生效，从节点最长一个同步周期（*/5 ≈ 5 分钟）后生效
 - 主节点单点：A 故障时从节点**继续服务**（保持最后版本），仅审批暂停、新记录堆积待处理
 - 仿冒检测是启发式（混淆归一化+编辑距离双档），不保证全覆盖；确认闭环依赖人工加白
 - 无 basic auth 的从节点，准入完全依赖 `allowed_clients` src 限制

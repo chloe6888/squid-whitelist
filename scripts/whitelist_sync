@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""whitelist_sync —— 从节点白名单同步 agent（部署于每个从节点，cron */2 拉取）
+"""whitelist_sync —— 从节点白名单同步 agent（部署于每个从节点，cron */5 拉取）
 
 主节点是白名单唯一权威；本脚本将主节点清单全量镜像到本机：
   SSH 拉取(whitelist_serve) → 归一化比对（域名集合 + 点前缀形态）→
