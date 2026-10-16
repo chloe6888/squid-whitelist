@@ -123,12 +123,12 @@ squid-whitelist/                     # 主节点A
 
 | 模块 | 关键接口 | 职责 |
 |---|---|---|
-| `layers.py` | `split_domains` / `validate_format` / `is_idn` / `check_similar` / `plan_merge` | 拆分归一、格式/IDN/相似度、覆盖判定与合并计划（分流/执行/mock 三处共用同一套吸收语义，纯逻辑） |
-| `netprobe.py` | `connect_check` / `wait_proxy_ready` / `resolve_ok` | CONNECT 原语（层0健康/复测观察）、端口就绪等待、DNS 可解析性（准入判定） |
-| `executor.py` | `NodeA.add_batch` | 批量原子事务：零触盘预检→备份→替换写入（含超集吸收）→reconfigure；失败回滚 |
-| `dingtalk_client.py` | `list_pending` / `update_record` | token 缓存、字段映射、翻页、按多状态过滤、单选纯字符串写入（锁定，无开关） |
-| `whitelist_serve` | （零参数） | 输出主节点白名单归一化清单（每行一条/小写，**保留点前缀形态**） |
-| `whitelist_sync` | （cron 驱动） | 拉取→比对（含形态）→预检→全量镜像→reconfigure；flock 防重叠，日志一行制 |
+| `wlcore/layers.py` | `split_domains` / `validate_format` / `is_idn` / `check_similar` / `plan_merge` | 拆分归一、格式/IDN/相似度、覆盖判定与合并计划（分流/执行/mock 三处共用同一套吸收语义，纯逻辑） |
+| `wlcore/netprobe.py` | `connect_check` / `wait_proxy_ready` / `resolve_ok` | CONNECT 原语（层0健康/复测观察）、端口就绪等待、DNS 可解析性（准入判定） |
+| `wlcore/executor.py` | `NodeA.add_batch` | 批量原子事务：零触盘预检→备份→替换写入（含超集吸收）→reconfigure；失败回滚 |
+| `wlcore/dingtalk_client.py` | `list_pending` / `update_record` | token 缓存、字段映射、翻页、按多状态过滤、单选纯字符串写入（锁定，无开关） |
+| `scripts/whitelist_serve` | （零参数） | 输出主节点白名单归一化清单（每行一条/小写，**保留点前缀形态**） |
+| `scripts/whitelist_sync` | （cron 驱动） | 拉取→比对（含形态）→预检→全量镜像→reconfigure；flock 防重叠，日志一行制 |
 
 ---
 
