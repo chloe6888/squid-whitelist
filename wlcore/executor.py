@@ -98,10 +98,11 @@ class NodeA:
         tmp_conf = self.conf.with_name(self.conf.name + '.txn')
         try:
             # 2) 新清单全文：现有行剔除被吸收的子域条目（空行/注释保留）
-            #    + 新规则排序追加
+            #    + 新规则排序追加（absorb 为原文形态，行过滤按裸名比对）
+            absorb_bare = {r.lstrip('.') for r in absorb}
             kept = [ln for ln in text.splitlines()
                     if not ln.strip() or ln.strip().startswith('#')
-                    or ln.strip().lower().lstrip('.') not in absorb]
+                    or ln.strip().lower().lstrip('.') not in absorb_bare]
             new_rules = sorted({self._rule_line(d) for d in todo})
             tmp_wl.write_text(''.join(ln + '\n' for ln in kept)
                               + ''.join(r + '\n' for r in new_rules),

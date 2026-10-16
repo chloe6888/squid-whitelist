@@ -55,7 +55,8 @@ class MockNode:
 
     def __init__(self, rules_list, audit, fail_domains=None):
         self.name = 'A(mock)'
-        self._rules = {str(r).lower().lstrip('.') for r in rules_list or []}
+        # 保留点前缀形态（与真实白名单解析一致：裸=仅精确，点前缀=含子域）
+        self._rules = {str(r).lower() for r in rules_list or []}
         self.fail_domains = {str(d).lower() for d in (fail_domains or [])}
         self.audit = audit
 
@@ -72,7 +73,8 @@ class MockNode:
                     'detail': '[mock]演练执行失败: %s' % ','.join(hit)}
         todo, skipped, absorb = plan_merge(self._rules, domains)
         self._rules -= absorb
-        self._rules.update(todo)
+        # 与真实执行器一致按 dot_prefix 写入（点前缀覆盖裸域+全部子域）
+        self._rules.update('.' + d for d in todo)
         log.info("[mock] 计划批量写入: %s（含预检/备份/reconfigure事务）", ','.join(todo))
         self.audit.action('mock-add-batch', added=todo, skipped=skipped,
                           replaced=sorted(absorb))

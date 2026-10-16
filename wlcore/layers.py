@@ -224,16 +224,22 @@ def check_similar(domain, known_seeds, whitelist_seeds):
 
 
 def is_covered(domain, rules):
-    """squid dstdomain 后缀语义：d == r 或 d.endswith('.'+r)（r 去前导点）。
+    """squid dstdomain 形态感知语义（2026-10-16 真机 parse 实测对齐）：
 
-    返回 (是否覆盖, 命中的规则原文)。方向性：申请比规则更宽（申请裸域、规则为子域）
-    不算覆盖。
+    点前缀规则 '.r' 覆盖 r 与全部子域；裸规则 'r' 仅精确匹配 r
+    （裸+子域并存 squid 可正常载入，正因裸条目不含子域语义）。
+    方向性：申请比规则更宽（申请裸域、规则为子域）不算覆盖。
+    返回 (是否覆盖, 命中的规则原文)。
     """
     for r in rules:
-        r2 = r.lower().lstrip('.').strip()
-        if not r2:
+        s = r.lower().strip()
+        if not s or s.startswith('#'):
             continue
-        if domain == r2 or domain.endswith('.' + r2):
+        if s.startswith('.'):
+            r2 = s.lstrip('.')
+            if r2 and (domain == r2 or domain.endswith('.' + r2)):
+                return True, r
+        elif domain == s:
             return True, r
     return False, None
 
@@ -263,15 +269,20 @@ def plan_merge(rules, domains):
     skip_set = set(skipped)
     skipped += [d for d in domains if d not in todo_set and d not in skip_set
                 and any(o != d and d.endswith('.' + o) for o in todo_set)]
-    absorb = {r for d in todo for r in rules if r.endswith('.' + d)}
+    absorb = {r for d in todo for r in rules
+              if r.lstrip('.').endswith('.' + d)}   # 层级按裸名比对，保留原文形态
     return todo, skipped, absorb
 
 
 def parse_whitelist_text(text):
-    """解析白名单文件文本 -> 规则集合（覆盖判定/执行环节共用）。"""
+    """解析白名单文件文本 -> 规则集合（覆盖判定/执行环节共用）。
+
+    保留前导点形态：squid 6.14 真机 parse 实测，裸条目仅精确匹配、
+    点前缀才覆盖裸域+全部子域——形态即语义（与 serve/sync 形态保真一致）。
+    """
     out = set()
     for line in (text or '').splitlines():
-        line = line.strip().lower().lstrip('.').strip()
+        line = line.strip().lower()
         if line and not line.startswith('#'):
             out.add(line)
     return out

@@ -113,10 +113,22 @@ print('== is_covered ==')
 rules = {'.openai.com', 'github.com', 'www.example.com'}
 check('点规则覆盖裸域', is_covered('openai.com', rules)[0])
 check('点规则覆盖子域', is_covered('api.openai.com', rules)[0])
-check('无点规则等价(后缀语义)', is_covered('www.github.com', rules)[0] and is_covered('github.com', rules)[0])
+check('裸规则仅精确匹配(squid实测语义)',
+      is_covered('github.com', rules)[0] and not is_covered('www.github.com', rules)[0])
 ok, r = is_covered('example.com', rules)
 check('方向性:子域规则不覆盖裸域', not ok)
 check('无关域名不覆盖', not is_covered('example.org', rules)[0])
+# 形态感知四形态（2026-10-16 真机 squid parse 实测对齐）
+check('裸超集规则不覆盖子域', not is_covered('aa.example.com', {'example.com'})[0])
+check('点前缀超集规则覆盖子域与裸域',
+      is_covered('aa.example.com', {'.example.com'})[0]
+      and is_covered('example.com', {'.example.com'})[0])
+todo, skipped, absorb = plan_merge({'example.com'}, ['aa.example.com'])
+check('裸规则下申请子域走新增(共存squid可正常载入)',
+      todo == ['aa.example.com'] and absorb == set(), (todo, skipped, absorb))
+todo, skipped, absorb = plan_merge({'.www.x.com'}, ['x.com'])
+check('点前缀子域条目同样被超集吸收',
+      todo == ['x.com'] and absorb == {'.www.x.com'}, (todo, absorb))
 
 # ---------------- 合并计划（覆盖/批内/超集吸收，分流与执行共用） ----------------
 print('== plan_merge ==')
@@ -144,7 +156,8 @@ check('方向性: 规则子域不吸收申请裸域',
 # ---------------- 白名单文本解析 ----------------
 print('== parse_whitelist_text ==')
 rules2 = parse_whitelist_text('# 注释\n.openai.com\n\nGitHub.COM\n  .baidu.com \n')
-check('注释/空行/大小写/前导点', rules2 == {'openai.com', 'github.com', 'baidu.com'}, rules2)
+check('注释/空行/大小写，点前缀形态保留',
+      rules2 == {'.openai.com', 'github.com', '.baidu.com'}, rules2)
 
 
 # ---------------- 清单文件加载（parse_whitelist_text 文件版） ----------------
