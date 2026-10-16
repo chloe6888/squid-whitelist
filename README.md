@@ -125,10 +125,10 @@ squid-whitelist/                     # 主节点A
 |---|---|---|
 | `wlcore/layers.py` | `split_domains` / `validate_format` / `is_idn` / `check_similar` / `plan_merge` | 拆分归一、格式/IDN/相似度、覆盖判定与合并计划（分流/执行/mock 三处共用同一套吸收语义，纯逻辑） |
 | `wlcore/netprobe.py` | `connect_check` / `wait_proxy_ready` / `resolve_ok` | CONNECT 原语（层0健康/复测观察）、端口就绪等待、DNS 可解析性（准入判定） |
-| `wlcore/executor.py` | `NodeA.add_batch` | 批量原子事务：零触盘预检→备份→替换写入（含超集吸收）→reconfigure；失败回滚 |
+| `wlcore/executor.py` | `NodeA.add_batch` | 批量原子事务：零触盘预检→备份（`whitelist-bak/`）→替换写入（含超集吸收）→reconfigure；失败回滚 |
 | `wlcore/dingtalk_client.py` | `list_pending` / `update_record` | token 缓存、字段映射、翻页、按多状态过滤、单选纯字符串写入（锁定，无开关） |
 | `scripts/whitelist_serve` | （零参数） | 输出主节点白名单归一化清单（每行一条/小写，**保留点前缀形态**） |
-| `scripts/whitelist_sync` | （cron 驱动） | 拉取→比对（含形态）→预检→全量镜像→reconfigure；flock 防重叠，日志一行制 |
+| `scripts/whitelist_sync` | （cron 驱动） | 拉取→比对（含形态）→预检→备份（`whitelist-bak/`）→全量镜像→reconfigure；flock 防重叠，日志一行制 |
 
 ---
 
@@ -258,7 +258,8 @@ cron 触发（*/1，flock 防重叠）
 squid -f 临时conf -k parse        ← 执行前检查：由 squid 自己裁决一切组合冲突
    ├─ 失败 → 正式文件从未被碰（零触盘）→ 整条记录转人工核查（审计记 parse 输出）
    ▼ 通过
-备份（时间戳快照，保留20份）→ 原子替换正式文件
+备份（时间戳快照，保留20份，统一存于白名单同目录 whitelist-bak/ 子目录）
+→ 原子替换正式文件
    │
    ▼
 squid -k reconfigure（失败重试一次）→ 等端口就绪（30~50ms 重绑窗口）
@@ -469,6 +470,7 @@ ssh root@<新节点> "diff <(sort /etc/squid/allowed_domains.list) <(ssh <A> whi
 | R22 | 冗余清理 | 删 `whitelist_mgr`（排查改 curl 一行）；移除 `select_write_format` 旋钮（固定纯字符串）；mock 替身移入 `mocks.py`；`main()` 拆 `process_record`/`decide_status`；执行器单次读文件+参数列表执行 |
 | R23 | 结论标签 | 面向申请人措辞：已存在→已在白名单（补位置宾语）、不合规→域名不合规（补主语），消除歧义 |
 | R24 | 覆盖语义形态感知 | `parse_whitelist_text` 保留点前缀，`is_covered` 按形态判定（裸=仅精确/点前缀=含子域）。真机 parse 实测依据：裸+子域并存可载、点前缀+子域并存 FATAL；absorb 层级比对按裸名，保留原文形态 |
+| R25 | 备份目录收拢 | 主节点执行器与从节点 sync 的 `.bak.<ts>` 备份统一入白名单同目录 `whitelist-bak/` 子目录（`execution.backup_dir` / 环境变量 `BACKUP_DIR` 可覆盖），`/etc/squid` 只剩在役文件；子目录同文件系统，回滚 replace 原子性不变；`.txn`/`.sync-tmp` 临时文件因原子替换依赖仍留白名单同目录 |
 
 钉钉 API 形态要点、单选 text 写入锁定、dot_prefix 实测结论等同旧版沿用。
 

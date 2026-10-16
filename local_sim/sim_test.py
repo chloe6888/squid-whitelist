@@ -117,7 +117,8 @@ def t2_add_batch(tmp, wl_shared):
     base = 'example-1.com\nexample-2.com\n'
 
     def bak_n():
-        return len(list(tmp.glob(wl_shared.name + '.bak.*')))
+        # 备份统一在 whitelist-bak/ 子目录（与生产 executor 同一逻辑）
+        return len(list((tmp / 'whitelist-bak').glob(wl_shared.name + '.bak.*')))
 
     def fresh(name, fail_at=0, fail_from=0):
         d = tmp / name
@@ -220,7 +221,8 @@ def t3_whitelist_sync(tmp):
     check('更新: rc=0 且日志updated', rc == 0 and ' updated ' in out, (rc, out))
     check('更新: 本地已镜像(排序+点前缀)',
           wl.read_text() == '.example-1.com\n.new-site.example\n', repr(wl.read_text()))
-    check('更新: 备份已生成', len(list(d.glob('allowed_domains.list.bak.*'))) == 1)
+    check('更新: 备份已生成(whitelist-bak/子目录)',
+          len(list((d / 'whitelist-bak').glob('allowed_domains.list.bak.*'))) == 1)
 
     # b) no-op：内容一致 → 零动作（squid调用数不再增长）
     count_before = (d / 'squid.count').read_text().strip()
@@ -243,7 +245,8 @@ def t3_whitelist_sync(tmp):
     rc, out, _err, wl = run_sync(d, fixture=d / 'fixture', fail_at=1)
     check('预检拒收: rc=1 日志rejected', rc == 1 and 'rejected' in out, (rc, out))
     check('预检拒收: 本地保持不变', wl.read_text() == 'example-1.com\n', repr(wl.read_text()))
-    check('预检拒收: 无备份', not list(d.glob('allowed_domains.list.bak.*')))
+    check('预检拒收: 无备份',
+          not list((d / 'whitelist-bak').glob('allowed_domains.list.bak.*')))
 
     # e) reconfigure 持续失败（含重试）→ 恢复备份
     d = tmp / 'sync_e'

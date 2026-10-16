@@ -56,6 +56,11 @@ class NodeA:
         # 点前缀才覆盖裸域+全部子域 → 默认 dot_prefix
         self.store_format = ex.get('store_format', 'dot_prefix')
         self.backup_keep = ex.get('backup_keep', 20)
+        # 备份统一存放目录：默认白名单同目录下 whitelist-bak/（自动创建），
+        # 不再把 /etc/squid 堆满 .bak.*；子目录=同文件系统，回滚 replace
+        # 原子性不变。.txn 临时文件仍留在白名单同目录（原子替换依赖）
+        self.backup_dir = Path(ex.get('backup_dir')
+                               or (self.path.parent / 'whitelist-bak'))
         self.proxy_auth = ex.get('proxy_auth') or None
         self.proxy_tls = bool(ex.get('proxy_tls', False))
         self.audit = audit
@@ -122,9 +127,11 @@ class NodeA:
                 self.audit.action('precheck-reject', node=self.name, output=out)
                 return {'ok': False, 'added': [], 'skipped': skipped,
                         'detail': '预检parse失败(正式文件未修改)，%s' % out}
-            # 4) 备份 → 原子替换
+            # 4) 备份 → 原子替换（备份入 backup_dir 子目录，回滚用跨目录
+            #    rename，同文件系统仍原子）
             ts = time.strftime('%Y%m%d-%H%M%S')
-            bak = self.path.with_name('%s.bak.%s' % (self.path.name, ts))
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            bak = self.backup_dir / ('%s.bak.%s' % (self.path.name, ts))
             shutil.copy2(self.path, bak)
             self._prune_backups()
             self.audit.action('backup', node=self.name, file=str(bak))
@@ -181,7 +188,7 @@ class NodeA:
         return rc == 0
 
     def _prune_backups(self):
-        baks = sorted(self.path.parent.glob(self.path.name + '.bak.*'))
+        baks = sorted(self.backup_dir.glob(self.path.name + '.bak.*'))
         for old in baks[:-self.backup_keep] if self.backup_keep else []:
             try:
                 old.unlink()

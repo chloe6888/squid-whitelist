@@ -67,6 +67,9 @@ execution:
   # 匹配，子域(www.)不放行；点前缀(.baidu.com)才覆盖裸域+全部子域
   store_format: dot_prefix
   backup_keep: 20               # 保留的备份份数
+  # backup_dir: /etc/squid/whitelist-bak   # 备份统一存放目录（缺省=白名单同目录下
+  #                                         # whitelist-bak/，自动创建；须与白名单同
+  #                                         # 文件系统，回滚 replace 保持原子）
   squid_cmd: "squid"
   proxy_auth: "user:password"   # 本机 squid basic 认证（层0/复测带 Proxy-Authorization 头）。
                                 # 无认证的主节点留空 ''

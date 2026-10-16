@@ -24,6 +24,8 @@ TLS 与否均可（与主节点混布）。
   WHITELIST     /etc/squid/allowed_domains.list
   SQUID_CONF    /etc/squid/squid.conf
   SQUID_BIN     squid       BACKUP_KEEP 10       SSH_TIMEOUT 10
+  BACKUP_DIR    /etc/squid/whitelist-bak（备份统一目录，自动创建；
+               与白名单同文件系统，回滚 replace 原子性不变）
   SYNC_FETCH_CMD  测试钩子：替代SSH拉取的本地命令（sim_test 用，生产勿设）
 
 用法：whitelist_sync [--selftest]
@@ -47,6 +49,7 @@ WHITELIST = Path(_env('WHITELIST', '/etc/squid/allowed_domains.list'))
 SQUID_CONF = Path(_env('SQUID_CONF', '/etc/squid/squid.conf'))
 SQUID_BIN = _env('SQUID_BIN', 'squid')
 BACKUP_KEEP = int(_env('BACKUP_KEEP', '10'))
+BACKUP_DIR = Path(_env('BACKUP_DIR', str(WHITELIST.parent / 'whitelist-bak')))
 
 
 def log(action, detail=''):
@@ -123,10 +126,12 @@ def _write_tmp_conf(tmp_conf, tmp_wl):
 
 
 def _backup():
+    """备份入 BACKUP_DIR 统一目录（回滚跨目录 rename，同文件系统仍原子）。"""
     ts = time.strftime('%Y%m%d-%H%M%S')
-    bak = WHITELIST.with_name('%s.bak.%s' % (WHITELIST.name, ts))
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    bak = BACKUP_DIR / ('%s.bak.%s' % (WHITELIST.name, ts))
     shutil.copy2(WHITELIST, bak)
-    baks = sorted(WHITELIST.parent.glob(WHITELIST.name + '.bak.*'))
+    baks = sorted(BACKUP_DIR.glob(WHITELIST.name + '.bak.*'))
     for old in (baks[:-BACKUP_KEEP] if BACKUP_KEEP else []):
         try:
             old.unlink()
