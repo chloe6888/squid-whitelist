@@ -32,12 +32,12 @@
 
 ```bash
 pip3 install -r requirements.txt                      # ① 依赖：requests + PyYAML（仅主节点）
-# ② 主节点 squid 初始化（证书/ACL 骨架，见 4.2，认证有无均可）
-# ③ 填写 config.yaml（base_id/operator_id 用 4.5 调试命令反查）
+# ② squid 已就绪（本 README 不含 squid 部署，运行前提见 4.1）
+# ③ 填写 config.yaml（base_id/operator_id 用 4.2 调试命令反查）
 python3 wlcore/dingtalk_client.py --config config.yaml --check    # ④ 验证钉钉连通（只读）
 python3 squid_whitelist.py --config config.yaml --dry-run      # ⑤ 判定演练（零写入）
-# ⑥ 表格状态单选加"处理中""部分放通"两选项 → 按 4.7 两阶段上 cron
-# ⑦ 从节点按 4.6 四步部署（可后做，不影响主节点运行）
+# ⑥ 表格状态单选加"处理中""部分放通"两选项 → 按 4.2 两阶段上 cron
+# ⑦ 从节点按 4.3 部署（可后做，不影响主节点运行）
 ```
 
 ## 目录
@@ -47,7 +47,7 @@ python3 squid_whitelist.py --config config.yaml --dry-run      # ⑤ 判定演�
 | [一、系统架构](#一系统架构) | 1.1 部署拓扑 · 1.2 代码结构 · 1.3 核心组件与数据流 |
 | [二、功能逻辑](#二功能逻辑) | 2.1 总体流程 · 2.2 状态机 · 2.3 域名处理流水线 · 2.4 主从同步机制 · 2.5 执行事务 |
 | [三、配置说明](#三配置说明configyaml) | config.yaml 逐块说明 |
-| [四、部署指南](#四部署指南) | 4.1 前置条件 → 4.2 squid 初始化 → 4.3 主节点部署 → 4.4 数据文件 → 4.5 钉钉连通 → 4.6 从节点部署与扩容 → 4.7 cron 上线 → 4.8 生产前检查 |
+| [四、部署指南](#四部署指南) | 4.1 前置条件 → 4.2 主节点部署（代码+定时任务） → 4.3 从节点部署与扩容（含定时任务） → 4.4 生产前检查 |
 | [五、测试与演练](#五测试与演练) | 测试矩阵 + mock 演练命令 |
 | [六、运维手册](#六运维手册) | 6.1 用户确认闭环 · 6.2 排查速查 · 6.3 人工改动白名单 · 6.4 审计与监控 |
 | [七、已知边界](#七已知边界) | 当前限制 |
@@ -307,106 +307,74 @@ CONNECT 复测：逐域名一次，纯观察项
 | 从节点 | squid≥5、Python≥3（仅标准库）；**有无 basic auth / TLS 均可**，可与主节点不同 |
 | 钉钉侧 | 企业内部应用 + 一张多维表，列为：域名/申请人/访问用途/申请日期/状态(单选**六项**)/结论 |
 
-### 4.2 squid 初始化
+squid 本身的安装与初始化不在本 README 范围（各节点认证方式可异构）。本系统运行仅依赖以下环境事实：
 
-自签证书与 basic 认证（带 auth 的节点）：
+- `squid.conf` 引用白名单文件：`acl allowed_domains dstdomain "/etc/squid/allowed_domains.list"`，且 ★ `allowed_domains` 是 allow 的**必要条件**、`deny all` 兜底——**严禁绕过白名单的直通行**（如 `http_access allow localhost`），否则层0健康检查与准入控制失效
+- `/etc/squid/allowed_domains.list` 文件已存在（空文件即可，从节点首次 sync 自动镜像）
+- 带 basic auth 的节点：`/etc/squid/passwd` 保持 **644**（helper 以 proxy 用户运行，640 会启动即崩且不易察觉）；主节点密码须与 `config.yaml` 的 `execution.proxy_auth` 一致
 
-```bash
-apt install squid apache2-utils
-mkdir -p /etc/squid/ssl
-openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
-  -keyout /etc/squid/ssl/squid_proxy.key -out /etc/squid/ssl/squid_proxy.crt \
-  -subj "/CN=squid-proxy"
-htpasswd -cb /etc/squid/passwd sing-box '你的密码'
-chmod 644 /etc/squid/passwd     # ⚠ 必须644：helper以proxy用户运行，640会启动即崩且不易察觉
-touch /etc/squid/allowed_domains.list
-```
-
-squid.conf **必须一致的骨架**（认证方式各节点可异）：
-
-```squid
-acl allowed_domains dstdomain "/etc/squid/allowed_domains.list"
-
-# —— 模板A：带 basic auth ——
-acl allowed_clients src <真实用户出口IP>
-acl authenticated_users proxy_auth REQUIRED
-http_access allow allowed_clients authenticated_users allowed_domains
-http_access deny all
-
-# —— 模板B：无 basic auth（务必保留 src 限制，否则使用者完全失控）——
-acl allowed_clients src <真实用户出口IP>
-http_access allow allowed_clients allowed_domains
-http_access deny all
-```
-
-> ★ 唯一硬性要求：`allowed_domains` 必须是 allow 的**必要条件**且 `deny all` 兜底。**严禁出现绕过白名单的直通行**（如 `http_access allow localhost`）——否则层0健康检查与准入控制失效。
-
-**改密码标准步骤**（带 auth 节点）：htpasswd → `chmod 644` → `pkill -x basic_ncsa_auth`（勿用 `-f`，会误杀自己脚本）→ 同步 `config.yaml proxy_auth`。
-
-### 4.3 主节点代码部署
+### 4.2 主节点部署（代码 + 定时任务）
 
 ```bash
+# ① 部署代码（排除运行时产物）
 rsync -av --exclude='data/audit.jsonl' --exclude='data/heartbeat' \
   --exclude='__pycache__' <源机>:~/squid-whitelist/ /opt/squid-whitelist/
 cd /opt/squid-whitelist && pip3 install -r requirements.txt
-cp config.example.yaml config.yaml    # 逐块填写（凭证反查见 4.5）
+# ② 填写配置（base_id/operator_id 用下面两条调试命令反查）
+cp config.example.yaml config.yaml
+python3 wlcore/dingtalk_client.py --config config.yaml --resolve '<表格完整URL>'
+python3 wlcore/dingtalk_client.py --config config.yaml --find-operator
+python3 wlcore/dingtalk_client.py --config config.yaml --check   # 只读冒烟：token/字段映射/待处理预览
+python3 squid_whitelist.py --config config.yaml --dry-run        # 判定演练（零写入）
+# ③ 部署只读清单输出（供从节点拉取）
 cp scripts/whitelist_serve /usr/local/bin/ && chmod 755 /usr/local/bin/whitelist_serve
 ```
 
-### 4.4 数据文件
+`data/known_domains.txt`（相似度种子，约60-100条）随仓库自带，人工低频维护。
 
-`data/known_domains.txt` 随仓库自带（相似度种子，约60-100条，人工维护）。旧版的 domestic/geosite/ip_cache 已随国内外判定一起废弃，不再需要。
-
-### 4.5 验证钉钉连通
+**定时任务（两阶段上线）**——观察期只判定不写入，人工复核结论后切生产：
 
 ```bash
-python3 wlcore/dingtalk_client.py --config config.yaml --resolve '<表格完整URL>'
-python3 wlcore/dingtalk_client.py --config config.yaml --find-operator
-python3 wlcore/dingtalk_client.py --config config.yaml --check
-python3 squid_whitelist.py --config config.yaml --dry-run
-```
-
-### 4.6 从节点部署与扩容（四步，主节点零改动）
-
-```bash
-# ① 新节点按 4.2 初始化 squid（模板A/B 任选），白名单留空（首次sync自动镜像）
-# ② 部署同步agent
-scp scripts/whitelist_sync root@<新节点>:/usr/local/bin/
-ssh root@<新节点> chmod 755 /usr/local/bin/whitelist_sync
-# ③ 共用受限密钥（所有从节点同一把）：主节点 authorized_keys 追加
-command="/usr/local/bin/whitelist_serve",no-pty,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA... replicas
-# ④ 新节点配 MASTER_HOST/SSH_KEY 后手动跑一次验证，再上 cron（见4.7）
-ssh root@<新节点> MASTER_HOST=<A地址> MASTER_KEY=/root/.ssh/id_ed25519 /usr/local/bin/whitelist_sync
-ssh root@<新节点> "diff <(sort /etc/squid/allowed_domains.list) <(ssh <A> whitelist_serve|sort)"   # 应一致
-```
-
-### 4.7 crontab + 日志
-
-```bash
-# ── 主节点：两阶段 ──
-# 阶段1·观察期（1~2天）：只判定不写入（连"处理中"都不写）
+# 阶段1·观察期（1~2天）：只判定不写入（连“处理中”都不写）
 */1 * * * * root /usr/bin/python3 /opt/squid-whitelist/squid_whitelist.py --dry-run \
     >> /var/log/squid_whitelist.log 2>&1
 # 阶段2·生产（复核阶段1结论后切换）
 #*/1 * * * * root /usr/bin/python3 /opt/squid-whitelist/squid_whitelist.py \
 #    >> /var/log/squid_whitelist.log 2>&1
+```
 
-# ── 从节点：同步 ──
+要点：脚本免 `cd`（启动即 chdir 到脚本目录）；`/etc/cron.d/` 与 `crontab -e` 格式差异注意第6字段用户名；日志可配 logrotate 轮转。
+
+### 4.3 从节点部署与扩容（四步，主节点零改动）
+
+```bash
+# ① 新节点 squid 就绪（运行前提见 4.1；白名单文件留空，首次 sync 自动镜像）
+# ② 部署同步 agent（自包含仅标准库，零依赖）
+scp scripts/whitelist_sync root@<新节点>:/usr/local/bin/
+ssh root@<新节点> chmod 755 /usr/local/bin/whitelist_sync
+# ③ 共用受限密钥（所有从节点同一把）：主节点 authorized_keys 追加
+command="/usr/local/bin/whitelist_serve",no-pty,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA... replicas
+# ④ 手动跑一次验证 + 与主节点比对，通过后上定时任务
+ssh root@<新节点> MASTER_HOST=<A地址> MASTER_KEY=/root/.ssh/id_ed25519 /usr/local/bin/whitelist_sync
+ssh root@<新节点> "diff <(sort /etc/squid/allowed_domains.list) <(ssh <A> whitelist_serve|sort)"   # 应一致
+```
+
+**定时任务（同步）**：
+
+```bash
 */2 * * * * root /usr/local/bin/whitelist_sync >> /var/log/whitelist_sync.log 2>&1
 ```
 
-要点：脚本免 `cd`（启动即 chdir 到脚本目录）；`/etc/cron.d/` 与 `crontab -e` 格式差异照旧注意（第6字段用户名）；logrotate 配置同旧版；主节点心跳 watchdog 同旧版。
+日志一行制（日志即心跳）：每次运行追加一行，静默落后时看最后一行时间戳即知（排查见 6.2）。
 
-### 4.8 生产前检查
+### 4.4 生产前检查
 
 - 表格单选确认为**六项**，文案与 config.yaml 精确一致（缺“处理中/部分放通”→写入被拒→记录停处理中，补齐后自愈）
 - `layer0.control_domains` 为白名单内稳定域名
-- 主节点 squid 骨架符合 4.2 ★（白名单是 allow 必要条件、无直通行）
+- 主节点 squid 骨架符合 4.1 ★（白名单是 allow 必要条件、无直通行）
 - 带 auth 的主节点：passwd 权限 644、config proxy_auth 同步、200/403/407 三返回码验证
 - 每台从节点手动跑一次 sync：首次镜像成功、二次 no-op、`--selftest` 坏内容拒收
 - dry-run 跑一轮真实数据，人工复核结论后再放开
-
----
 
 ## 五、测试与演练
 
