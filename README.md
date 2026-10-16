@@ -360,10 +360,20 @@ ssh root@<新节点> MASTER_HOST=<A地址> MASTER_KEY=/root/.ssh/id_ed25519 /usr
 ssh root@<新节点> "diff <(sort /etc/squid/allowed_domains.list) <(ssh <A> whitelist_serve|sort)"   # 应一致
 ```
 
+**MASTER_HOST 填址两坑（2026-10-16 节点B实装踩过）**：
+
+1. `<A地址>` 必须是**该从节点可路由到 A 的地址**——跨 VPC 时两边私网 IP 可能撞车（本环境 A/B 内网同为 `10.1.0.6`，从节点连它会连到自己），必须用 A 公网 IP；
+2. 首次连接需先把 **A 的主机密钥指纹核对后**写入从节点 `known_hosts`（sync 的 SSH 是 BatchMode，不交互确认，未收录直接报 `Host key verification failed`）：
+
+```bash
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub              # A 上看真实指纹
+ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # 两者一致才可入known_hosts'
+```
+
 **定时任务（同步）**：
 
 ```bash
-*/2 * * * * root /usr/local/bin/whitelist_sync >> /var/log/whitelist_sync.log 2>&1
+*/2 * * * * root MASTER_HOST=<A地址> MASTER_KEY=/root/.ssh/id_ed25519 /usr/local/bin/whitelist_sync >> /var/log/whitelist_sync.log 2>&1
 ```
 
 日志一行制（日志即心跳）：每次运行追加一行，静默落后时看最后一行时间戳即知（排查见 6.2）。
