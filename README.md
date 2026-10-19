@@ -100,7 +100,8 @@ squid-whitelist/                     # 主节点A
 │   ├── whitelist_serve         #   部署于主节点 /usr/local/bin：供从节点拉取的只读清单输出
 │   └── whitelist_sync          #   部署于每个从节点 /usr/local/bin：拉取→比对→预检→镜像→reconfigure
 ├── tests/
-│   └── test_layers.py          # 拆分/格式/相似度/覆盖 单测
+│   ├── test_layers.py          # 拆分/格式/相似度/覆盖/原因码 单测
+│   └── test_main.py            # 主入口纯逻辑单测（六态/结论组装/码表/脱敏/审计轮转）
 ├── local_sim/                  # 测试基建（无 squid/SSH/钉钉环境验证全链路）
 │   ├── fake_proxy.py           #   模拟squid的CONNECT代理
 │   ├── fake_squid.sh           #   squid命令桩（按调用序号注入失败/杀进程崩溃）
@@ -417,7 +418,10 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 
 | 命令 | 覆盖内容 |
 |---|---|
-| `python3 tests/test_layers.py` | 拆分（容错/Markdown/端口/去重/截断）、格式、IDN、相似度（含短域相对阈值）、覆盖方向性、合并计划 plan_merge（覆盖/批内/超集吸收）、清单文件加载 |
+| `python3 tests/test_layers.py` | 拆分（容错/Markdown/端口/去重/截断）、格式、IDN、相似度（含短域相对阈值）、覆盖方向性、合并计划 plan_merge（覆盖/批内/超集吸收）、清单文件加载、原因码 |
+| `python3 tests/test_main.py` | 主入口纯逻辑：六态判定边界、结论组装顺序、REASON_SHORT 码表完备性、凭证脱敏（递归/过短跳过）、审计与心跳脱敏、审计轮转 keep 语义 |
+
+> tests/ 与 local_sim/ 全部测试**两种跑法**：`python3 <文件>` 直跑（汇总+退出码，pytest 非依赖），装了 pytest 则 `pytest tests/` 自动收集（`test_*` 函数断言式失败）。
 | `python3 local_sim/sim_test.py` | 全链路：批量事务（成功/预检零触盘/回滚/超集吸收/批内吸收）、pending-reload（标记写失败中止/回滚成败删标记/**崩溃注入(替换后reconfigure前被杀)下轮补偿**/补偿失败重试/主从两侧/dry-run 零写入）、**元数据契约（主从两实现 × umask × 原权限：替换后属主/权限保留，回滚权限恢复）**、**凭证脱敏（fetch 失败时 appkey/appsecret 不落审计/心跳/日志）**、DNS 准入 E2E、whitelist_sync 子进程真跑（no-op/更新/拒收/master不可达/**形态保真不加点加宽**/**flock 防重叠**/selftest）、serve 输出保真、E2E 多域名六态全出口、处理中回收 |
 | `python3 local_sim/test_dingtalk.py` | 钉钉客户端：token/映射/翻页/多状态过滤/text写入闭环/**nextToken重复与页数上限防护** |
 | `python3 squid_whitelist.py --mock data/mock_records.json` | mock 全路径演练：六态全出口零副作用 |
