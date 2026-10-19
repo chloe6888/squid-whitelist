@@ -309,6 +309,7 @@ CONNECT 复测：逐域名一次，纯观察项
 | `layers` | `max_per_run` | 每轮记录上限 |
 | | `max_domains_per_record` | 单记录域名上限（默认 20，超出截断+提示分批） |
 | | `dns_check` / `dns_timeout` | 待新增域名 DNS 可解析性准入（默认开；解析不出=死条目→驳回）；单次解析限时秒数，失败自动重试1次 |
+| | `known_domains_required` | 种子清单缺失/为空时：默认 `false`=降级运行（审计 `known-domains-missing` 留痕+告警日志）；`true`=中止本轮（记录原地不动，防"无仿冒检测"批量放行） |
 | `execution` | `auto` | true=自动写入 \| false=仅判定回写不执行 |
 | | `store_format` | 锁定 `dot_prefix` |
 | | `proxy_auth` / `proxy_tls` | 本机探测凭证；**可为空**（无 basic auth 的主节点） |

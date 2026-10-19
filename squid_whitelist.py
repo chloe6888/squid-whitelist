@@ -470,7 +470,9 @@ def main():
     labels = build_labels(cfg['dingtalk'])
 
     # ---- 组件装配（提前至层0之前：pending-reload 补偿需要 node） ----
-    known_seeds = load_domain_list(paths.get('known_domains', 'data/known_domains.txt'))
+    lay = cfg.get('layers', {})
+    known_path = paths.get('known_domains', 'data/known_domains.txt')
+    known_seeds = load_domain_list(known_path)
     if mock is not None:
         from wlcore.mocks import MockNode, MockTable, mock_whitelist
         node = MockNode(mock_whitelist(mock.get('whitelist'),
@@ -488,6 +490,25 @@ def main():
 
     # 脱敏集合在组件装配后补挂（Audit 构造先于 table；mock 表无凭证）
     audit.secrets = collect_secrets(cfg, table)
+
+    # ---- 种子清单缺失显式留痕（2026-10-19）----
+    # 缺失/为空 = 仿冒检测整层静默失效（审批照常放行）——不能只留一条
+    # warning 日志。默认降级运行（审计+告警日志留痕）；required 模式直接
+    # 中止本轮，记录原地不动，防"无仿冒检测"状态下批量放行。
+    if not known_seeds:
+        required = bool(lay.get('known_domains_required', False))
+        audit.event('known-domains-missing', path=str(known_path),
+                    required=required)
+        if required:
+            log.error('知名域名种子清单缺失/为空且 known_domains_required=true，'
+                      '本轮中止: %s', known_path)
+            write_heartbeat(paths.get('heartbeat', 'data/heartbeat'),
+                            {'ts': datetime.now().isoformat(timespec='seconds'),
+                             'result': 'known-domains-missing',
+                             'reason': 'seed清单缺失/为空且known_domains_required=true'},
+                            secrets=audit.secrets)
+            return 1
+        log.warning('知名域名种子清单缺失或为空，仿冒检测降级运行: %s', known_path)
 
     # ---- pending-reload 补偿（层0之前）----
     # 上轮事务可能在"替换后、reconfigure 完成前"中断，磁盘清单与运行配置
@@ -524,7 +545,6 @@ def main():
                         secrets=audit.secrets)
         return 1
 
-    lay = cfg.get('layers', {})
     records = records[:lay.get('max_per_run', 20)]
     ctx = SimpleNamespace(
         table=table, node=node, labels=labels, known_seeds=known_seeds,

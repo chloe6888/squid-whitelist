@@ -15,7 +15,7 @@
      reconfigure失败回滚 / 主删从删镜像 / --selftest /
      回滚成功删标记 / 崩溃注入(替换后reconfigure前被杀)与下轮补偿 / 补偿失败重试）
   T4 E2E squid_whitelist 子进程（层0故障整批跳过 / 多域名四组结论六态 /
-     处理中回收 / 两连写顺序 / mock零落盘）
+     处理中回收 / 两连写顺序 / mock零落盘 / 种子清单缺失降级与必需中止）
   T5 主节点 pending-reload 补偿（子进程真跑非mock：无标记零调用 /
      补偿成功删标记 / 补偿失败保留 / dry-run 零写入）
   T6 元数据契约（主NodeA.add_batch / 从whitelist_sync 两实现 × umask ×
@@ -454,7 +454,8 @@ def t3_whitelist_sync(tmp):
 
 # ================================================================ T4
 
-def write_sim_config(tmp, wl_abs, known_abs, dns_check=False, dt_api_base=None):
+def write_sim_config(tmp, wl_abs, known_abs, dns_check=False, dt_api_base=None,
+                     extra_layers=''):
     conf = make_conf(tmp / 'squid.conf', wl_abs)
     cfg = """dingtalk:
   app_key: sim-appkey-0123456789
@@ -477,7 +478,7 @@ layer0:
   control_domains: [example-1.com, example-2.com]
   min_healthy: 1
   timeout: 5
-layers: {max_per_run: 20, max_domains_per_record: 20, dns_check: %s, dns_timeout: 2}
+layers: {max_per_run: 20, max_domains_per_record: 20, dns_check: %s, dns_timeout: 2%s}
 execution: {auto: true, store_format: dot_prefix, backup_keep: 5, squid_cmd: "%s"}
 paths:
   known_domains: %s
@@ -486,7 +487,8 @@ paths:
   lock_file: %s
 """ % (('\n  api_base: %s\n  oapi_base: %s' % (dt_api_base, dt_api_base))
           if dt_api_base else '',
-       SIM_PORT, conf, wl_abs, 'true' if dns_check else 'false', STUB, known_abs,
+       SIM_PORT, conf, wl_abs, 'true' if dns_check else 'false', extra_layers,
+       STUB, known_abs,
        tmp / 'audit.jsonl', tmp / 'heartbeat', tmp / 'lock')
     p = tmp / 'sim.yaml'
     p.write_text(cfg, encoding='utf-8')
@@ -659,6 +661,32 @@ def t4_gate(tmp):
     check('DNS: 零新增不落盘',
           not (d / 'wl.list').exists()
           or (d / 'wl.list').read_text() == '')
+
+    # 4e) 种子清单缺失：默认降级运行（审计留痕）；required=true 中止本轮
+    #     （仿冒检测整层静默失效不能只留一条日志；中止时记录原地不动）
+    for req, want_rc, want_hb in ((False, 0, 'ok'), (True, 1, 'known-domains-missing')):
+        d = tmp / ('gate_seed_%s' % req)
+        d.mkdir()
+        mock = d / 'mock.json'
+        mock.write_text(json.dumps({
+            'layer0': {'ok': True},
+            'whitelist': [],
+            'records': [rec('s1', 'seed-missing.com')],
+        }, ensure_ascii=False), encoding='utf-8')
+        cfg = write_sim_config(d, d / 'wl.list', d / 'no-such-seed.txt',
+                               extra_layers=', known_domains_required: %s'
+                                            % ('true' if req else 'false'))
+        p = run_gate(cfg, mock)
+        events = [json.loads(l) for l in (d / 'audit.jsonl').read_text().splitlines()]
+        miss = [e for e in events if e['event'] == 'known-domains-missing']
+        ends = [e for e in events if e['event'] == 'record-end']
+        hb = json.loads((d / 'heartbeat').read_text())
+        check('种子缺失(required=%s): rc=%s 心跳=%s 审计留痕/记录处置正确'
+              % (req, want_rc, want_hb),
+              p.returncode == want_rc and hb.get('result') == want_hb
+              and len(miss) == 1 and miss[0]['required'] is req
+              and bool(ends) == (not req),
+              (p.returncode, hb, len(miss), len(ends)))
 
 
 # ================================================================ T5

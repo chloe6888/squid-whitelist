@@ -60,6 +60,8 @@ layers:
   max_domains_per_record: 20    # 单条记录域名上限（拆分去重后超出截断，结论提示分批）
   dns_check: true               # 待新增域名须可解析（节点本地=与squid同环境，解析不出=死条目→驳回）
   dns_timeout: 3                # 单次解析限时(秒)；失败自动重试1次抗抖动
+  known_domains_required: false # 种子清单缺失/为空时：false=降级运行（审计留痕+告警日志）；
+                                # true=中止本轮（记录原地不动，防"无仿冒检测"批量放行）
 
 execution:
   auto: true                    # true=全自动落盘+reload | false=仅判定回写不执行
