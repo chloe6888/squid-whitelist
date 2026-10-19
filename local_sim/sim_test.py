@@ -9,11 +9,15 @@
 
 场景：
   T1 connect_check 原语（假代理：白名单200 / 非白名单403）
-  T2 主节点批量原子事务 add_batch（成功 / 预检parse失败零触盘 / reconfigure失败回滚）
+  T2 主节点批量原子事务 add_batch（成功 / 预检parse失败零触盘 / reconfigure失败回滚 /
+     回滚成功删标记 / 标记写失败中止 / 补偿成败与dry-run只报告）
   T3 whitelist_sync 子进程真跑（更新 / no-op / 主端不可达 / 预检拒收 /
-     reconfigure失败回滚 / 主删从删镜像 / --selftest）
+     reconfigure失败回滚 / 主删从删镜像 / --selftest /
+     回滚成功删标记 / 崩溃注入(替换后reconfigure前被杀)与下轮补偿 / 补偿失败重试）
   T4 E2E squid_whitelist 子进程（层0故障整批跳过 / 多域名四组结论六态 /
      处理中回收 / 两连写顺序 / mock零落盘）
+  T5 主节点 pending-reload 补偿（子进程真跑非mock：无标记零调用 /
+     补偿成功删标记 / 补偿失败保留 / dry-run 零写入）
 
 用法：python3 local_sim/sim_test.py
 """
@@ -49,17 +53,34 @@ def check(name, cond, detail=''):
     print('%s %s%s' % (tag, name, ('  | ' + str(detail)) if (detail and not cond) else ''))
 
 
-def stub_env(tmp, fail_at=0, fail_from=0):
-    """fake_squid.sh 的运行环境（每次场景独立计数）。"""
+def stub_env(tmp, fail_at=0, fail_from=0, fail_list=''):
+    """fake_squid.sh 的运行环境（每次场景独立计数）。
+
+    注入变量必须显式清除：stub_env 继承 os.environ，上轮场景（T2 的
+    fresh() 会写回 os.environ）遗留的 FAIL_LIST/KILL 会波及后续所有场景。"""
     env = dict(os.environ)
     env['SQUID_LOG'] = str(tmp / 'squid.log')
     env['SQUID_COUNT_FILE'] = str(tmp / 'squid.count')
     env['SQUID_FAIL_AT'] = str(fail_at)
     env['SQUID_FAIL_FROM'] = str(fail_from or 999999)
+    env.pop('SQUID_FAIL_LIST', None)
+    if fail_list:
+        env['SQUID_FAIL_LIST'] = str(fail_list)
+    env.pop('SQUID_KILL_PARENT_AT', None)
     return env
 
 
 STUB = 'bash %s' % (REPO / 'local_sim' / 'fake_squid.sh')
+
+
+def set_stub_env(tmp, fail_at=0, fail_from=0, fail_list=''):
+    """写入本进程 os.environ（T2/T5 in-process 场景用）。
+
+    os.environ.update 不删除缺失键——条件注入变量（FAIL_LIST/KILL_PARENT）
+    必须显式清掉，否则上轮场景遗留波及后续所有场景。"""
+    for k in ('SQUID_FAIL_LIST', 'SQUID_KILL_PARENT_AT'):
+        os.environ.pop(k, None)
+    os.environ.update(stub_env(tmp, fail_at, fail_from, fail_list))
 
 
 def pick_sim_port():
@@ -115,17 +136,18 @@ def node_a_cfg(wl, conf):
 def t2_add_batch(tmp, wl_shared):
     print('== T2 主节点批量原子事务 add_batch ==')
     base = 'example-1.com\nexample-2.com\n'
+    marker = tmp / (wl_shared.name + '.pending-reload')
 
     def bak_n():
         # 备份统一在 whitelist-bak/ 子目录（与生产 executor 同一逻辑）
         return len(list((tmp / 'whitelist-bak').glob(wl_shared.name + '.bak.*')))
 
-    def fresh(name, fail_at=0, fail_from=0):
+    def fresh(name, fail_at=0, fail_from=0, fail_list=''):
         d = tmp / name
         d.mkdir()
         wl_shared.write_text(base)          # 与假代理共享同一份白名单
         conf = make_conf(d / 'squid.conf', wl_shared)
-        os.environ.update(stub_env(d, fail_at, fail_from))
+        set_stub_env(d, fail_at, fail_from, fail_list)
         return d, wl_shared, conf, Audit(d / 'audit.jsonl')
 
     # 成功路径：一次事务写入多个域名
@@ -146,6 +168,7 @@ def t2_add_batch(tmp, wl_shared):
     check('成功: 复测为观察项(经假代理200)', obs.get('new-1.example') == 200, obs)
     check('成功: tmp文件已清理', not (tmp / 'wl_global.txn').exists()
           and not (d / 'squid.conf.txn').exists())
+    check('成功: 无pending-reload标记残留', not marker.exists())
 
     # 预检 parse 失败（第1次调用）→ 零触盘：正式文件/备份均未动
     d, wl, conf, audit = fresh('parsefail', fail_at=1)
@@ -157,13 +180,49 @@ def t2_add_batch(tmp, wl_shared):
     check('预检失败: 审计有precheck-reject',
           'precheck-reject' in (d / 'audit.jsonl').read_text())
 
-    # reconfigure 持续失败（含重试）→ 回滚
+    # reconfigure 持续失败（含重试，回滚 reload 也失败）→ 回滚且标记保留
     d, wl, conf, audit = fresh('reloadfail', fail_from=2)
     na = NodeA(node_a_cfg(wl, conf), audit)
     r = na.add_batch(['roll-reload.com'])
     check('reconfigure失败: 拒绝', not r['ok'] and 'reconfigure失败' in r['detail'], r)
     check('reconfigure失败: 文件回滚', wl.read_text() == base, repr(wl.read_text()))
     check('reconfigure失败: 审计有rollback', 'rollback' in (d / 'audit.jsonl').read_text())
+    check('reconfigure失败(回滚reload也失败): 标记保留待补偿', marker.exists())
+    # 补偿失败（squid 仍持续失败）→ 标记保留
+    r = na.pending_reload_compensate()
+    check('补偿失败: 只报告不抛异常', r['found'] and not r['compensated']
+          and marker.exists(), r)
+    # dry-run：发现标记只报告不动作（零写入承诺）
+    marker.write_text('x')
+    r = na.pending_reload_compensate(dry_run=True)
+    check('补偿dry-run: 只报告不动标记',
+          r['found'] and not r['compensated'] and marker.exists(), r)
+    # squid 恢复后补偿成功：删标记；此前共6次调用（parse/reload/重试/回滚reload/
+    # 补偿reload/补偿重试），成功补偿恰新增第7次且为 reconfigure
+    set_stub_env(d)
+    r = na.pending_reload_compensate()
+    calls = (d / 'squid.log').read_text().splitlines()
+    check('补偿成功: 删标记且恰一次reconfigure',
+          r['found'] and r['compensated'] and not marker.exists()
+          and len(calls) == 7 and 'reconfigure' in calls[6], (r, calls))
+
+    # 回滚成功（reconfigure+重试失败、回滚 reload 成功）→ 删标记
+    d, wl, conf, audit = fresh('rollbackok', fail_list='2,3')
+    na = NodeA(node_a_cfg(wl, conf), audit)
+    r = na.add_batch(['roll-ok.com'])
+    check('回滚成功: 拒绝且文件回滚', not r['ok'] and wl.read_text() == base,
+          (r, repr(wl.read_text())))
+    check('回滚成功: 标记已删(磁盘与运行配置恢复一致)', not marker.exists())
+
+    # 标记写入失败（路径被目录占位）→ 在 replace 之前中止，零触盘
+    d, wl, conf, audit = fresh('markerfail')
+    marker.mkdir()                          # 占位使 os.open 必败
+    na = NodeA(node_a_cfg(wl, conf), audit)
+    r = na.add_batch(['marker-fail.com'])
+    check('标记写失败: 中止且白名单零触盘',
+          not r['ok'] and '标记写入失败' in r['detail']
+          and wl.read_text() == base, (r, repr(wl.read_text())))
+    marker.rmdir()
 
     # 超集吸收（防线：主流程分流后执行端再核一遍）——子域条目被超集替换
     d, wl, conf, audit = fresh('superset')
@@ -199,15 +258,18 @@ def t3_whitelist_sync(tmp):
     print('== T3 whitelist_sync（子进程真跑，SYNC_FETCH_CMD替代SSH） ==')
     sync = str(REPO / 'scripts' / 'whitelist_sync')
 
-    def run_sync(d, fixture=None, fail_at=0, fail_from=0, fetch_cmd=None, args=()):
+    def run_sync(d, fixture=None, fail_at=0, fail_from=0, fetch_cmd=None, args=(),
+                 fail_list='', kill_parent_at=0):
         d.mkdir(parents=True, exist_ok=True)
         wl = d / 'allowed_domains.list'
         conf = make_conf(d / 'squid.conf', wl)
-        env = stub_env(d, fail_at, fail_from)
+        env = stub_env(d, fail_at, fail_from, fail_list)
         env.update({'WHITELIST': str(wl), 'SQUID_CONF': str(conf),
-                    'SQUID_BIN': STUB,
+                    'SQUID_BIN': STUB, 'SQUID_PORT': str(SIM_PORT),
                     'BACKUP_KEEP': '5',
                     'SYNC_FETCH_CMD': fetch_cmd or ('cat %s' % fixture)})
+        if kill_parent_at:
+            env['SQUID_KILL_PARENT_AT'] = str(kill_parent_at)
         p = subprocess.run([sys.executable, sync] + list(args), env=env,
                            capture_output=True, text=True, timeout=60)
         return p.returncode, p.stdout.strip(), p.stderr.strip(), wl
@@ -223,6 +285,8 @@ def t3_whitelist_sync(tmp):
           wl.read_text() == '.example-1.com\n.new-site.example\n', repr(wl.read_text()))
     check('更新: 备份已生成(whitelist-bak/子目录)',
           len(list((d / 'whitelist-bak').glob('allowed_domains.list.bak.*'))) == 1)
+    check('更新: 无pending-reload标记残留',
+          not (d / 'allowed_domains.list.pending-reload').exists())
 
     # b) no-op：内容一致 → 零动作（squid调用数不再增长）
     count_before = (d / 'squid.count').read_text().strip()
@@ -248,7 +312,7 @@ def t3_whitelist_sync(tmp):
     check('预检拒收: 无备份',
           not list((d / 'whitelist-bak').glob('allowed_domains.list.bak.*')))
 
-    # e) reconfigure 持续失败（含重试）→ 恢复备份
+    # e) reconfigure 持续失败（含重试，回滚 reload 也失败）→ 恢复备份且标记保留
     d = tmp / 'sync_e'
     d.mkdir()
     (d / 'fixture').write_text('.example-1.com\n.new-2.example\n', encoding='utf-8')
@@ -257,6 +321,20 @@ def t3_whitelist_sync(tmp):
     check('reconfigure失败: rc=1 已回滚', rc == 1 and 'failed' in out, (rc, out))
     check('reconfigure失败: 文件恢复原状', wl.read_text() == 'example-1.com\n',
           repr(wl.read_text()))
+    check('reconfigure失败(回滚reload也失败): 标记保留',
+          (d / 'allowed_domains.list.pending-reload').exists())
+
+    # e2) 回滚成功（reconfigure+重试失败、回滚 reload 成功）→ 删标记
+    d = tmp / 'sync_e2'
+    d.mkdir()
+    (d / 'fixture').write_text('.example-1.com\n.new-3.example\n', encoding='utf-8')
+    (d / 'allowed_domains.list').write_text('example-1.com\n', encoding='utf-8')
+    rc, out, _err, wl = run_sync(d, fixture=d / 'fixture', fail_list='2,3')
+    check('回滚成功: rc=1 已回滚', rc == 1 and 'failed' in out, (rc, out))
+    check('回滚成功: 文件恢复原状', wl.read_text() == 'example-1.com\n',
+          repr(wl.read_text()))
+    check('回滚成功: 标记已删(磁盘与运行配置恢复一致)',
+          not (d / 'allowed_domains.list.pending-reload').exists())
 
     # f) 全量镜像：主删 → 从删
     d = tmp / 'sync_f'
@@ -327,17 +405,59 @@ def t3_whitelist_sync(tmp):
     rc, out, _err, wl = run_sync(d, fixture=d / 'fixture')
     check('flock: 释放后正常同步', rc == 0 and 'updated' in out, (rc, out))
 
+    # k) 崩溃注入：白名单已替换、reconfigure 生效前进程被 SIGKILL
+    #    （桩第2次调用=首次reconfigure时 kill -9 父进程）
+    d = tmp / 'sync_k'
+    d.mkdir()
+    (d / 'fixture').write_text('.example-1.com\n.crash-site.example\n', encoding='utf-8')
+    (d / 'allowed_domains.list').write_text('example-1.com\n', encoding='utf-8')
+    marker = d / 'allowed_domains.list.pending-reload'
+    rc, out, _err, wl = run_sync(d, fixture=d / 'fixture', kill_parent_at=2)
+    check('崩溃注入: 进程被杀(returncode=-9)', rc == -9, rc)
+    check('崩溃注入: 新内容已落盘(替换先于reconfigure)',
+          wl.read_text() == '.crash-site.example\n.example-1.com\n',
+          repr(wl.read_text()))
+    check('崩溃注入: 标记保留', marker.exists())
+    count_after_crash = int((d / 'squid.count').read_text().strip())
+    # 下一轮：补偿恰一次 reconfigure（先于 fetch/no-op 判定），随后 no-op 收尾
+    rc, out, _err, wl = run_sync(d, fixture=d / 'fixture')
+    check('崩溃补偿: 日志compensated且标记删除',
+          'compensated' in out and not marker.exists(), out)
+    check('崩溃补偿: 本地文件保持崩溃时内容',
+          wl.read_text() == '.crash-site.example\n.example-1.com\n',
+          repr(wl.read_text()))
+    call_lines = [l for l in (d / 'squid.log').read_text().splitlines()
+                  if l.startswith('call#')]
+    new_calls = call_lines[count_after_crash:]
+    check('崩溃补偿: 恰好多一次reconfigure(本轮唯一squid调用)',
+          len(new_calls) == 1 and 'reconfigure' in new_calls[0], new_calls)
+    check('崩溃补偿: 之后no-op(synced)', 'synced' in out, out)
+
+    # l) 补偿失败：标记保留，本轮同步继续（此处收尾no-op），下轮重试成功
+    d = tmp / 'sync_l'
+    d.mkdir()
+    (d / 'fixture').write_text('.example-1.com\n', encoding='utf-8')
+    (d / 'allowed_domains.list').write_text('.example-1.com\n', encoding='utf-8')
+    marker = d / 'allowed_domains.list.pending-reload'
+    marker.write_text('x')
+    rc, out, _err, wl = run_sync(d, fixture=d / 'fixture', fail_from=1)
+    check('补偿失败: 日志compensate-failed且标记保留',
+          'compensate-failed' in out and marker.exists(), out)
+    check('补偿失败: 本轮同步继续(no-op收尾)', 'synced' in out and rc == 0, (rc, out))
+    rc, out, _err, wl = run_sync(d, fixture=d / 'fixture')
+    check('补偿重试: 成功且标记删除', 'compensated' in out and not marker.exists(), out)
+
 
 # ================================================================ T4
 
-def write_sim_config(tmp, wl_abs, known_abs, dns_check=False):
+def write_sim_config(tmp, wl_abs, known_abs, dns_check=False, dt_api_base=None):
     conf = make_conf(tmp / 'squid.conf', wl_abs)
     cfg = """dingtalk:
   app_key: x
   app_secret: x
   base_id: x
   sheet_id: x
-  operator_id: x
+  operator_id: x%s
   status_field: "状态"
   conclusion_field: "结论"
   status_pending: "待处理"
@@ -360,7 +480,8 @@ paths:
   audit_log: %s
   heartbeat: %s
   lock_file: %s
-""" % (SIM_PORT, conf, wl_abs, 'true' if dns_check else 'false', STUB, known_abs,
+""" % (('\n  api_base: %s' % dt_api_base) if dt_api_base else '',
+       SIM_PORT, conf, wl_abs, 'true' if dns_check else 'false', STUB, known_abs,
        tmp / 'audit.jsonl', tmp / 'heartbeat', tmp / 'lock')
     p = tmp / 'sim.yaml'
     p.write_text(cfg, encoding='utf-8')
@@ -535,6 +656,82 @@ def t4_gate(tmp):
           or (d / 'wl.list').read_text() == '')
 
 
+# ================================================================ T5
+
+def t5_master_compensate(tmp):
+    """主节点 pending-reload 补偿（子进程真跑，非 mock）。
+
+    钉钉 api_base 指向关闭端口 → 拉取必败（rc=1），但补偿在拉取之前执行，
+    恰好隔离验证补偿环节本身。"""
+    print('== T5 主节点 pending-reload 补偿（子进程真跑，非mock） ==')
+
+    def setup(name):
+        d = tmp / name
+        d.mkdir()
+        wl = d / 'allowed_domains.list'
+        wl.write_text('.example-1.com\n')
+        (d / 'known.txt').write_text('aliyun.com\n', encoding='utf-8')
+        cfg = write_sim_config(d, wl, d / 'known.txt',
+                               dt_api_base='http://127.0.0.1:9')
+        return d, wl, cfg
+
+    def run_main(cfg, extra=()):
+        return subprocess.run([sys.executable, str(REPO / 'squid_whitelist.py'),
+                               '--config', str(cfg)] + list(extra),
+                              capture_output=True, text=True, timeout=180)
+
+    def audit_events(d):
+        return [json.loads(l) for l in (d / 'audit.jsonl').read_text().splitlines()]
+
+    # a) 无标记：正常运行零额外 squid 调用（补偿承诺不伤常态路径）
+    d, wl, cfg = setup('comp_a')
+    set_stub_env(d)
+    p = run_main(cfg)
+    check('无标记: 拉取失败rc=1(钉钉指向关闭端口)', p.returncode == 1, p.returncode)
+    check('无标记: 零squid调用(无额外reconfigure)', not (d / 'squid.log').exists())
+    check('无标记: audit无pending-reload事件',
+          not any(e['event'] == 'pending-reload' for e in audit_events(d)))
+
+    # b) 有标记 → 层0之前补偿：恰一次 reconfigure，标记删除
+    d, wl, cfg = setup('comp_b')
+    marker = wl.with_name(wl.name + '.pending-reload')
+    marker.write_text('x')
+    set_stub_env(d)
+    p = run_main(cfg)
+    check('标记补偿: rc=1(拉取失败)但补偿已完成', p.returncode == 1, p.stderr[-300:])
+    comp = [e for e in audit_events(d) if e['event'] == 'pending-reload']
+    check('标记补偿: audit记录compensated=true', len(comp) == 1
+          and comp[0]['compensated'] is True, comp)
+    check('标记补偿: 标记已删除', not marker.exists())
+    calls = (d / 'squid.log').read_text().splitlines()
+    check('标记补偿: 恰一次reconfigure(补偿先于拉取)',
+          len(calls) == 1 and 'reconfigure' in calls[0], calls)
+
+    # c) 补偿失败（squid 持续失败）→ 标记保留，主流程不被中断
+    d, wl, cfg = setup('comp_c')
+    marker = wl.with_name(wl.name + '.pending-reload')
+    marker.write_text('x')
+    set_stub_env(d, fail_from=1)
+    p = run_main(cfg)
+    comp = [e for e in audit_events(d) if e['event'] == 'pending-reload']
+    check('补偿失败: 标记保留且流程继续(rc=1来自拉取)',
+          p.returncode == 1 and marker.exists()
+          and len(comp) == 1 and comp[0]['compensated'] is False, (p.returncode, comp))
+
+    # d) dry-run：发现标记只报告不补偿（零写入承诺）
+    d, wl, cfg = setup('comp_d')
+    marker = wl.with_name(wl.name + '.pending-reload')
+    marker.write_text('x')
+    set_stub_env(d)
+    p = run_main(cfg, extra=['--dry-run'])
+    comp = [e for e in audit_events(d) if e['event'] == 'pending-reload']
+    check('dry-run: 标记保留零squid调用', marker.exists()
+          and not (d / 'squid.log').exists())
+    check('dry-run: audit记录未补偿', len(comp) == 1
+          and comp[0]['compensated'] is False
+          and 'dry-run' in comp[0]['detail'], comp)
+
+
 _PROXY = None
 
 
@@ -553,6 +750,7 @@ def main():
         t2_add_batch(tmp, wl_global)
         t3_whitelist_sync(tmp)
         t4_gate(tmp)
+        t5_master_compensate(tmp)
     finally:
         _PROXY.stop()
         print('\n清理临时目录: %s' % tmp)

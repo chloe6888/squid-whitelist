@@ -421,16 +421,7 @@ def main():
 
     labels = build_labels(cfg['dingtalk'])
 
-    # ---- 层0 ----
-    ok, reason = layer0_check(cfg, mock, audit)
-    if not ok:
-        log.error('层0预检失败，整批跳过（记录原地不动）：%s', reason)
-        write_heartbeat(paths.get('heartbeat', 'data/heartbeat'),
-                        {'ts': datetime.now().isoformat(timespec='seconds'),
-                         'result': 'layer0-failed', 'reason': reason})
-        return 0
-
-    # ---- 组件装配 ----
+    # ---- 组件装配（提前至层0之前：pending-reload 补偿需要 node） ----
     known_seeds = load_domain_list(paths.get('known_domains', 'data/known_domains.txt'))
     if mock is not None:
         from wlcore.mocks import MockNode, MockTable, mock_whitelist
@@ -446,6 +437,27 @@ def main():
         node = NodeA(cfg, audit)
         from wlcore.dingtalk_client import DingTalkTable
         table = DingTalkTable(cfg['dingtalk'])
+
+    # ---- pending-reload 补偿（层0之前）----
+    # 上轮事务可能在"替换后、reconfigure 完成前"中断，磁盘清单与运行配置
+    # 漂移且不会自愈：先补一次 reconfigure 对齐再干活。mock 演练不触盘
+    # 天然无标记；dry-run 只报告不补偿（保持零写入）。补偿失败保留标记、
+    # 不中断本轮——层0/后续 add_batch 自身的 reconfigure 会继续尝试收敛。
+    if mock is None:
+        comp = node.pending_reload_compensate(dry_run=dry_run)
+        if comp['found']:
+            log.warning('pending-reload: %s', comp['detail'])
+            audit.event('pending-reload', compensated=comp['compensated'],
+                        detail=comp['detail'])
+
+    # ---- 层0 ----
+    ok, reason = layer0_check(cfg, mock, audit)
+    if not ok:
+        log.error('层0预检失败，整批跳过（记录原地不动）：%s', reason)
+        write_heartbeat(paths.get('heartbeat', 'data/heartbeat'),
+                        {'ts': datetime.now().isoformat(timespec='seconds'),
+                         'result': 'layer0-failed', 'reason': reason})
+        return 0
 
     # ---- 拉取 待处理 + 处理中（上轮中断回收：写入幂等，重跑无副作用） ----
     try:

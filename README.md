@@ -103,7 +103,7 @@ squid-whitelist/                     # 主节点A
 │   └── test_layers.py          # 拆分/格式/相似度/覆盖 单测
 ├── local_sim/                  # 测试基建（无 squid/SSH/钉钉环境验证全链路）
 │   ├── fake_proxy.py           #   模拟squid的CONNECT代理
-│   ├── fake_squid.sh           #   squid命令桩（SQUID_FAIL_AT=N 注入第N次失败）
+│   ├── fake_squid.sh           #   squid命令桩（按调用序号注入失败/杀进程崩溃）
 │   ├── fake_dingtalk.py        #   假钉钉API服务
 │   ├── sim_test.py             #   集成测试
 │   └── test_dingtalk.py        #   钉钉客户端测试
@@ -146,6 +146,12 @@ squid-whitelist/                     # 主节点A
 
 ```
 cron 触发（*/1，flock 防重叠）
+   │
+   ▼
+【补偿】pending-reload 遗留标记检查（层0之前）
+   ├─ 标记存在 = 上轮事务在"替换后、reconfigure 完成前"中断 → 补一次
+   │  reconfigure 使磁盘清单与运行配置对齐，成功后删标记
+   └─ 失败保留标记下轮重试，不中断本轮；dry-run 只报告；mock 不涉及
    │
    ▼
 【层0】本机 squid 健康预检（整批前一次性）
@@ -235,8 +241,9 @@ cron 触发（*/1，flock 防重叠）
   │                                        不等 ↓
   │                                     ④ 零触盘预检：tmp清单+tmp.conf → squid -f tmp -k parse
   │                                        失败 → 拒绝落地（本地保持最后good版本）
-  │                                     ⑤ 备份 → 原子替换 → squid -k reconfigure + 等端口
-  │                                        失败 → 恢复备份
+  │                                     ⑤ 写 pending-reload 标记 → 备份 → 原子替换
+  │                                        → squid -k reconfigure + 等端口 → 删标记
+  │                                        失败 → 恢复备份（回滚后 reconfigure 成功才删标记）
   │                                     ⑥ 日志一行（updated +N -M / 失败原因）
 ```
 
@@ -246,7 +253,8 @@ cron 触发（*/1，flock 防重叠）
 | 语义保真 | 条目**点前缀形态原样镜像**：裸条目=仅精确匹配，点前缀=裸域+全部子域（squid 6.14 实测）。不静默加宽裸条目——否则主节点按精确匹配、从节点按全子域放行，同一规则两边行为漂移。serve 遇裸条目向 stderr 告警提示补点 |
 | 单写者 | 分叉无从产生；主节点文件即使被改坏，从节点预检拒收，坏内容不扩散 |
 | 防重叠 | flock（`allowed_domains.list.sync-lock`）：上一轮未结束（ssh/parse 慢场景）本轮直接 busy 退出，不并发写同一 tmp 文件 |
-| 幂等 | 每次运行先比对（域名集合+形态），无变化零动作（不写盘不 reload） |
+| 幂等 | 每次运行先比对（域名集合+形态），无变化**且无遗留标记**时零动作（不写盘不 reload）；有遗留 pending-reload 标记时先补一次 reconfigure 再比对（见 2.5） |
+| 崩溃自愈 | 事务用 pending-reload 标记（白名单同目录）包夹"替换→reconfigure"段：进程在窗口内死亡，下轮 sync **一开始**（fetch 之前、不依赖主端可达）补一次 reconfigure 对齐并删标记——补偿先于 no-op 判定，否则主端无新变更时永远没有补偿机会 |
 | 生效方式 | `squid -k reconfigure` 平滑重载（端口重绑窗口实测仅 30~50ms，不断活跃连接）。**严禁 restart**（秒级空窗+全量断流） |
 | 依赖 | 同步链路不经过 squid 的 http_access：从节点**有无 basic auth、TLS 与否均可混布**，sync 零感知 |
 | 监控 | 日志即心跳：每次运行向 `/var/log/whitelist_sync.log` 追加一行；静默落后时看最后一行时间戳即知 |
@@ -266,12 +274,14 @@ cron 触发（*/1，flock 防重叠）
 squid -f 临时conf -k parse        ← 执行前检查：由 squid 自己裁决一切组合冲突
    ├─ 失败 → 正式文件从未被碰（零触盘）→ 整条记录转人工核查（审计记 parse 输出）
    ▼ 通过
-备份（时间戳快照，保留20份，统一存于白名单同目录 whitelist-bak/ 子目录）
+写 pending-reload 标记（白名单同目录 `.pending-reload`，文件+目录 fsync——
+   断电时标记必须先于替换持久化；写失败即中止，正式文件未被碰）
+→ 备份（时间戳快照，保留20份，统一存于白名单同目录 whitelist-bak/ 子目录）
 → 原子替换正式文件
    │
    ▼
-squid -k reconfigure（失败重试一次）→ 等端口就绪（30~50ms 重绑窗口）
-   ├─ 失败 → 恢复备份 → 人工核查
+squid -k reconfigure（失败重试一次）→ 等端口就绪（30~50ms 重绑窗口）→ 删标记
+   ├─ 失败 → 恢复备份 → 人工核查（回滚后 reconfigure 成功才删标记）
    ▼
 CONNECT 复测：逐域名一次，纯观察项
    （200/403/502/504 均算写入成功——成败只看配置链，与目标站点无关）
@@ -279,6 +289,7 @@ CONNECT 复测：逐域名一次，纯观察项
 ```
 
 - **写入形态**：`store_format: dot_prefix`（`.example.com`）。squid 6.14 实测：裸条目仅精确匹配，点前缀才覆盖裸域+全部子域
+- **pending-reload 补偿（2026-10-19）**：替换后、reconfigure 完成前进程死亡，磁盘清单与运行配置漂移且**永不自愈**（表格已回写"已放通"而代理仍拒绝；从节点 no-op 提前退出挡死补偿）。主从事务均以标记包夹该窗口（事务序：写标记并 fsync → 备份 → 替换 → reconfigure → 等端口就绪 → 删标记）。主节点每轮层0之前、从节点每轮 sync 最前（fetch 之前）检查标记补一次 reconfigure。**删标记判据=reconfigure rc==0**——等端口就绪仅 best-effort 不参与判据，否则端口配置不符的节点会陷入每轮补偿循环；标记写失败在替换之前中止事务；补偿失败保留标记下轮重试、不中断本轮；dry-run 只报告不补偿（零写入）；mock 演练不触盘天然无标记
 - **回滚条件只剩两个**：预检/parse 失败、reconfigure 失败——均与目标站点、出口 IP、网络状况完全无关
 - **超集自动吸收**：申请 `example.com` 而白名单已有 `www.example.com` 时，squid 6.14 拒载“子域+超集并存”（FATAL `X is a subdomain of .Y`）——同事务内新增 `.example.com` 并剔除其覆盖的子域条目（超集完整覆盖子域的匹配范围，替换零风险、无需人工处理）；同批既有超集又有其子域时只写超集
 - **审计**：recordId、申请人、每个域名的分流结果与原因、事务各步（含被吸收条目）、复测观察值、回写结果
@@ -384,6 +395,8 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 */5 * * * * root MASTER_HOST=<A地址> MASTER_KEY=/root/.ssh/id_ed25519 /usr/local/bin/whitelist_sync >> /var/log/whitelist_sync.log 2>&1
 ```
 
+本机 squid 端口非 13128 时在 cron 行加 `SQUID_PORT=<端口>`（reconfigure 后等端口就绪用；不设只影响该等待的准确性，不影响同步成败与删标记判据）。
+
 日志一行制（日志即心跳）：每次运行追加一行，静默落后时看最后一行时间戳即知（排查见 6.2）。
 
 ### 4.4 生产前检查
@@ -402,7 +415,7 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 | 命令 | 覆盖内容 |
 |---|---|
 | `python3 tests/test_layers.py` | 拆分（容错/Markdown/端口/去重/截断）、格式、IDN、相似度（含短域相对阈值）、覆盖方向性、合并计划 plan_merge（覆盖/批内/超集吸收）、清单文件加载 |
-| `python3 local_sim/sim_test.py` | 全链路：批量事务（成功/预检零触盘/回滚/超集吸收/批内吸收）、DNS 准入 E2E、whitelist_sync 子进程真跑（no-op/更新/拒收/master不可达/**形态保真不加点加宽**/**flock 防重叠**/selftest）、serve 输出保真、E2E 多域名六态全出口、处理中回收 |
+| `python3 local_sim/sim_test.py` | 全链路：批量事务（成功/预检零触盘/回滚/超集吸收/批内吸收）、pending-reload（标记写失败中止/回滚成败删标记/**崩溃注入(替换后reconfigure前被杀)下轮补偿**/补偿失败重试/主从两侧/dry-run 零写入）、DNS 准入 E2E、whitelist_sync 子进程真跑（no-op/更新/拒收/master不可达/**形态保真不加点加宽**/**flock 防重叠**/selftest）、serve 输出保真、E2E 多域名六态全出口、处理中回收 |
 | `python3 local_sim/test_dingtalk.py` | 钉钉客户端：token/映射/翻页/多状态过滤/text写入闭环 |
 | `python3 squid_whitelist.py --mock data/mock_records.json` | mock 全路径演练：六态全出口零副作用 |
 | `python3 squid_whitelist.py --dry-run` | 真实数据演练：只判定零写入 |
@@ -430,6 +443,7 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 | 记录长期"处理中" | 脚本反复崩溃或回写失败 | 日志查异常栈；audit 查 writeback_ok=false；表格选项是否缺"处理中/部分放通" |
 | 从节点不生效 | `/var/log/whitelist_sync.log` 最后一行 | master-unreachable→SSH/密钥；rejected→主节点文件被改坏；busy→上一轮卡住（查ssh/parse耗时）；时间戳过旧→cron没跑 |
 | 从节点白名单与主不一致 | diff 两边 | 手动跑一次 sync；确认无人工单边改动（会被自动覆盖，若被绕过说明 sync 没在跑） |
+| audit 频繁 `pending-reload`（compensated=false）/ sync 日志 `compensate-failed` | 上轮事务中断后，补偿 reconfigure 一直失败 | 先解决 reconfigure 本身（看事件 detail / 日志输出：squid 进程、conf 错误）；成功后标记自动删除，无需手工清理 |
 | 手工验证代理放行（任一节点） | `curl --proxy-insecure -x https://user:pass@127.0.0.1:13128 -sI https://域名/ -o /dev/null -w '%{http_code}\n'`（无 auth/TLS 节点改 `-x http://...`） | 200=放行；403=不在白名单；其余=出口/站点问题 |
 | 申请已放通但用户不通 | 白名单已含 → 站点封该节点出口 IP 或用户节点未同步（≤5分钟窗口） | 等同步窗口；持续不通=站点对出口IP的封锁，非白名单问题，考虑换出口 |
 

@@ -6,8 +6,14 @@
 
 add_batch 事务（一条记录的全部待新增域名一次写入，全成或全败）：
   幂等预检/超集吸收 → 零触盘预检（tmp清单+tmp.conf，由 squid -k parse 裁决）
-  → 备份 → 原子替换（含被吸收子域条目的剔除）→ reconfigure → 等端口就绪
-  → CONNECT 复测（纯观察项）
+  → 写 pending-reload 标记 → 备份 → 原子替换（含被吸收子域条目的剔除）
+  → reconfigure → 等端口就绪 → 删标记 → CONNECT 复测（纯观察项）
+
+pending-reload 补偿（2026-10-19）：替换后、reconfigure 完成前进程死亡会使
+磁盘清单与运行配置漂移且永不自愈。事务先落盘标记（文件+目录 fsync，断电时
+必须先于替换持久化），下轮运行层0之前补偿一次 reconfigure。
+删标记判据=reconfigure rc==0；wait_ready 仅 best-effort 等待（不参与去留，
+否则端口配置不符的节点会陷入每轮补偿循环）。
 
 2026-10-15 架构重构：
   - 单域 add → 批量 add_batch（一次备份+多行追加+一次 reconfigure）
@@ -17,6 +23,7 @@ add_batch 事务（一条记录的全部待新增域名一次写入，全成或�
 """
 
 import logging
+import os
 import shlex
 import shutil
 import subprocess
@@ -64,6 +71,68 @@ class NodeA:
         self.proxy_auth = ex.get('proxy_auth') or None
         self.proxy_tls = bool(ex.get('proxy_tls', False))
         self.audit = audit
+        # pending-reload 标记：白名单同目录，事务内先于替换持久化
+        self.marker = self.path.with_name(self.path.name + '.pending-reload')
+
+    # ---- reconfigure / pending-reload 标记 ----
+    def _reload(self, retry=True):
+        """reconfigure（失败可选重试一次）+ 等端口就绪 -> (rc, out, ready)。"""
+        rc, out = _squid_cmd_result(self._squid_argv + ['-k', 'reconfigure'])
+        if rc != 0 and retry:
+            time.sleep(0.5)
+            rc, out = _squid_cmd_result(self._squid_argv + ['-k', 'reconfigure'])
+        ready = wait_proxy_ready('127.0.0.1', self.proxy_port, timeout=5)
+        return rc, out, ready
+
+    def _write_marker(self):
+        """落盘 pending-reload 标记，返回 None 或失败原因。
+
+        文件与目录都 fsync：断电场景下标记必须先于替换持久化，否则
+        rename 落盘而标记丢失，崩溃窗口不可补偿（kill 测试验逻辑，
+        目录 fsync 管断电物理持久性）。"""
+        try:
+            fd = os.open(self.marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                         0o600)
+            try:
+                os.write(fd, time.strftime('%Y-%m-%d %H:%M:%S').encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            dfd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as e:
+            return str(e)
+        return None
+
+    def _clear_marker(self):
+        try:
+            self.marker.unlink()
+        except OSError:
+            pass
+
+    def pending_reload_compensate(self, dry_run=False):
+        """补偿遗留 pending-reload 标记（主流程每轮层0之前调用）。
+
+        标记存在=上轮事务可能在"替换后、reconfigure 完成前"中断，磁盘
+        清单可能与运行配置漂移 → 补一次 reconfigure 对齐。删标记判据=
+        rc==0；失败保留标记下轮重试（不抛异常，主流程继续走层0的结果）。
+        返回 {'found','compensated','detail'}。
+        """
+        if not self.marker.exists():
+            return {'found': False, 'compensated': False, 'detail': ''}
+        if dry_run:
+            return {'found': True, 'compensated': False,
+                    'detail': 'dry-run：发现遗留标记，未补偿（零写入）'}
+        rc, out, _ready = self._reload()
+        if rc == 0:
+            self._clear_marker()
+            return {'found': True, 'compensated': True,
+                    'detail': '补偿reconfigure成功，标记已删除'}
+        return {'found': True, 'compensated': False,
+                'detail': '补偿reconfigure失败(rc=%s)标记保留，%s' % (rc, out)}
 
     # ---- 只读 ----
     def rules(self):
@@ -127,6 +196,13 @@ class NodeA:
                 self.audit.action('precheck-reject', node=self.name, output=out)
                 return {'ok': False, 'added': [], 'skipped': skipped,
                         'detail': '预检parse失败(正式文件未修改)，%s' % out}
+            # 3.5) 事务标记：先于任何正式文件改动持久化（断电时必须先于
+            #      替换落盘，见 _write_marker）；写失败必须在 os.replace
+            #      之前中止——文件系统有病就不碰正式文件
+            err = self._write_marker()
+            if err:
+                return {'ok': False, 'added': [], 'skipped': skipped,
+                        'detail': 'pending-reload标记写入失败(正式文件未修改)，%s' % err}
             # 4) 备份 → 原子替换（备份入 backup_dir 子目录，回滚用跨目录
             #    rename，同文件系统仍原子）
             ts = time.strftime('%Y%m%d-%H%M%S')
@@ -139,17 +215,14 @@ class NodeA:
             self.audit.action('replace', node=self.name, rules=new_rules,
                               absorbed=replaced)
             # 5) reconfigure（失败重试一次）+ 等端口就绪（kid 重绑 30~50ms 窗口）
-            rc, out = _squid_cmd_result(self._squid_argv + ['-k', 'reconfigure'])
-            if rc != 0:
-                time.sleep(0.5)
-                rc, out = _squid_cmd_result(self._squid_argv + ['-k', 'reconfigure'])
-            ready = wait_proxy_ready('127.0.0.1', self.proxy_port, timeout=5)
+            rc, out, ready = self._reload()
             if rc != 0 or not ready:
                 rb = self._rollback(bak)
                 return {'ok': False, 'added': [], 'skipped': skipped,
                         'detail': 'reconfigure失败(rc=%s, ready=%s)已回滚，%s'
                                   % (rc, ready, out),
                         'rollback_ok': rb}
+            self._clear_marker()   # 判据=reconfigure rc==0（_rollback 内同判据）
             self.audit.action('reload', node=self.name)
             # 6) CONNECT 复测：纯观察项，任何结果都不回滚（成败只看配置链）。
             #    403/502/504 与目标站点/出口网络有关，与白名单写入无关。
@@ -174,7 +247,10 @@ class NodeA:
                     pass
 
     def _rollback(self, bak):
-        """恢复备份 → 再次reconfigure。返回回滚是否成功。"""
+        """恢复备份 → 再次reconfigure。返回回滚是否成功。
+
+        回滚成功（含回滚后reconfigure rc==0）= 磁盘清单与运行配置恢复
+        一致 → 删 pending-reload 标记；失败保留标记等下轮补偿。"""
         try:
             bak.replace(self.path)
         except OSError as e:
@@ -182,9 +258,10 @@ class NodeA:
             self.audit.action('rollback-failed', node=self.name, file=str(bak),
                               error=str(e))
             return False
-        rc, out = _squid_cmd_result(self._squid_argv + ['-k', 'reconfigure'])
-        wait_proxy_ready('127.0.0.1', self.proxy_port, timeout=5)
+        rc, _out, _ready = self._reload(retry=False)
         self.audit.action('rollback', node=self.name, reload_rc=rc)
+        if rc == 0:
+            self._clear_marker()
         return rc == 0
 
     def _prune_backups(self):

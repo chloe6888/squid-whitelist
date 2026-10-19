@@ -3,12 +3,18 @@
 """whitelist_sync —— 从节点白名单同步 agent（部署于每个从节点，cron */5 拉取）
 
 主节点是白名单唯一权威；本脚本将主节点清单全量镜像到本机：
-  SSH 拉取(whitelist_serve) → 归一化比对（域名集合 + 点前缀形态）→
-  无变化零动作（不写盘不reload）；有变化 → 零触盘预检(squid -f tmp.conf
-  -k parse，坏内容拒收不落地) → 备份 → 原子替换 → reconfigure
-  （严禁 restart：秒级空窗+断流）。失败恢复备份，本地始终保持最后good版本。
+  遗留标记补偿 → SSH 拉取(whitelist_serve) → 归一化比对（域名集合 + 点前缀
+  形态）→ 无变化且无遗留标记时零动作（不写盘不reload）；有变化 → 零触盘预检
+  (squid -f tmp.conf -k parse，坏内容拒收不落地) → 写 pending-reload 标记 →
+  备份 → 原子替换 → reconfigure（严禁 restart：秒级空窗+断流）→ 删标记。
+  失败恢复备份，本地始终保持最后good版本。
   条目形态原样保留：裸条目=仅精确匹配，点前缀=裸域+全部子域（squid 6.14
   实测），主从语义不漂移。flock 防重叠（ssh 90s+parse 30s 可能超 cron 周期）。
+
+pending-reload 补偿（2026-10-19）：上轮"替换后、reconfigure 完成前"中断会
+使磁盘清单与运行配置漂移且永不自愈（no-op 提前退出挡死补偿机会），故每轮
+sync_once 最前（fetch 之前、不依赖主端可达）检查标记并补一次 reconfigure。
+删标记判据=reconfigure rc==0；_wait_ready 仅 best-effort（不参与去留）。
 
 全量镜像语义：主删从删；本机手工改动会被下次同步覆盖（特性：增删改只在
 主节点做一处）。同步链路不经过 http_access → 本机 squid 有无 basic auth、
@@ -23,7 +29,8 @@ TLS 与否均可（与主节点混布）。
   MASTER_KEY    /root/.ssh/id_ed25519（受限密钥，所有从节点共用一把）
   WHITELIST     /etc/squid/allowed_domains.list
   SQUID_CONF    /etc/squid/squid.conf
-  SQUID_BIN     squid       BACKUP_KEEP 10       SSH_TIMEOUT 10
+  SQUID_BIN     squid       SQUID_PORT 13128（reconfigure 后等端口就绪用）
+  BACKUP_KEEP 10           SSH_TIMEOUT 10
   BACKUP_DIR    /etc/squid/whitelist-bak（备份统一目录，自动创建；
                与白名单同文件系统，回滚 replace 原子性不变）
   SYNC_FETCH_CMD  测试钩子：替代SSH拉取的本地命令（sim_test 用，生产勿设）
@@ -34,7 +41,9 @@ TLS 与否均可（与主节点混布）。
 
 import fcntl
 import os
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -48,8 +57,10 @@ def _env(key, default):
 WHITELIST = Path(_env('WHITELIST', '/etc/squid/allowed_domains.list'))
 SQUID_CONF = Path(_env('SQUID_CONF', '/etc/squid/squid.conf'))
 SQUID_BIN = _env('SQUID_BIN', 'squid')
+SQUID_PORT = int(_env('SQUID_PORT', '13128'))
 BACKUP_KEEP = int(_env('BACKUP_KEEP', '10'))
 BACKUP_DIR = Path(_env('BACKUP_DIR', str(WHITELIST.parent / 'whitelist-bak')))
+MARKER = WHITELIST.with_name(WHITELIST.name + '.pending-reload')
 
 
 def log(action, detail=''):
@@ -106,13 +117,74 @@ def acquire_lock():
 
 def squid(args, timeout=30):
     """执行 squid 命令 -> (rc, 输出摘要)。SQUID_BIN 可为带参数的完整命令。"""
-    import shlex
     try:
         p = subprocess.run(shlex.split(SQUID_BIN) + args, capture_output=True,
                            text=True, timeout=timeout)
         return p.returncode, ((p.stdout or '') + (p.stderr or '')).strip()[:300]
     except subprocess.TimeoutExpired:
         return 124, 'squid命令超时'
+
+
+def _wait_ready(timeout=5.0):
+    """reconfigure 后等监听端口恢复（squid kid 重绑窗口实测 30~50ms）。
+
+    best-effort：超时只说明端口未恢复或 SQUID_PORT 不符，不作为事务成败
+    或删标记判据（判据只看 reconfigure rc）。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            with socket.create_connection(('127.0.0.1', SQUID_PORT), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.02)
+    return False
+
+
+def _write_marker():
+    """落盘 pending-reload 标记，返回 None 或失败原因。
+
+    文件与目录都 fsync：断电场景下标记必须先于替换持久化，否则 rename
+    落盘而标记丢失，崩溃窗口不可补偿。与主节点 executor 各自实现（自包含
+    原则），语义由 sim_test 契约用例保证一致。"""
+    try:
+        fd = os.open(MARKER, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, time.strftime('%Y-%m-%d %H:%M:%S').encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        dfd = os.open(WHITELIST.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError as e:
+        return str(e)
+    return None
+
+
+def _clear_marker():
+    try:
+        MARKER.unlink()
+    except OSError:
+        pass
+
+
+def compensate_pending_reload():
+    """补偿遗留 pending-reload 标记（sync_once 最前调用）。
+
+    放在 fetch 之前：补偿只依赖本地 squid，主端不可达时也能治愈本地漂移；
+    也因此天然越过"remote == local 则 no-op 退出"的挡道。删标记判据=
+    reconfigure rc==0；失败保留标记下轮重试（不中断本轮同步）。"""
+    if not MARKER.exists():
+        return
+    rc, out = squid(['-k', 'reconfigure'])
+    if rc == 0:
+        _wait_ready()
+        _clear_marker()
+        log('compensated', '遗留pending-reload标记已补偿reconfigure')
+    else:
+        log('compensate-failed', '标记保留下轮重试 %s' % out[:120])
 
 
 def _write_tmp_conf(tmp_conf, tmp_wl):
@@ -141,6 +213,9 @@ def _backup():
 
 
 def sync_once():
+    # 最前补偿（锁后）：消除上轮"替换后、reconfigure 完成前"中断的漂移；
+    # 必须先于 fetch 与 no-op 比对，否则主端无新变更时永远没有补偿机会
+    compensate_pending_reload()
     remote_rc, remote_out, remote_err = fetch_master()
     if remote_rc != 0:
         log('master-unreachable', 'rc=%s %s' % (remote_rc, (remote_err or '').strip()[:120]))
@@ -172,6 +247,12 @@ def sync_once():
             # 主节点内容有问题（或与本机组合有冲突）：拒收，保持最后good版本
             log('rejected', '预检parse失败，保持本地不变 %s' % out[:120])
             return 1
+        # 事务标记先于备份落盘（断电时必须先于替换持久化）；
+        # 写失败在 replace 之前中止——文件系统有病就不碰正式文件
+        err = _write_marker()
+        if err:
+            log('error', 'pending-reload标记写入失败，中止（本地保持不变）: %s' % err)
+            return 1
         bak = _backup()
         tmp_wl.replace(WHITELIST)
         rc, out = squid(['-k', 'reconfigure'])
@@ -179,14 +260,21 @@ def sync_once():
             time.sleep(0.5)
             rc, out = squid(['-k', 'reconfigure'])
         if rc != 0:
+            # 回滚：恢复备份后再次reconfigure；rc==0 才删标记
+            # （=磁盘清单与运行配置已恢复一致），失败保留等下轮补偿
             try:
                 bak.replace(WHITELIST)
             except OSError as e:
-                log('error', 'reconfigure失败且回滚失败(备份保留): %s %s' % (out[:120], e))
+                log('error', 'reconfigure失败且回滚失败(备份与标记保留): %s %s'
+                    % (out[:120], e))
                 return 1
-            squid(['-k', 'reconfigure'])
+            rb_rc, _rb_out = squid(['-k', 'reconfigure'])
+            if rb_rc == 0:
+                _clear_marker()
             log('failed', 'reconfigure失败已回滚 %s' % out[:120])
             return 1
+        _wait_ready()      # best-effort，不参与成败/删标记判据
+        _clear_marker()    # 删标记判据 = reconfigure rc==0
         log('updated', '+%d -%d -> %d rules'
             % (len(set(remote) - set(local)), len(set(local) - set(remote)),
                len(remote)))
