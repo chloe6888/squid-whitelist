@@ -63,6 +63,18 @@ check('单标签被拒', not validate_format('localhost')[0])
 check('连字符开头被拒', not validate_format('-bad.example.com')[0])
 check('纯数字TLD被拒', not validate_format('example.123')[0])
 
+# 原因码（三层文案解耦：码→结论短语，完整原因进审计）
+check('码: 空串→empty', validate_format('')[2] == 'empty')
+check('码: IP→ip', validate_format('192.168.1.1')[2] == 'ip')
+check('码: 端口→colon', validate_format('a.com:80')[2] == 'colon')
+check('码: 空格类→whitespace', validate_format('a b.com')[2] == 'whitespace')
+check('码: 其它非法字符→bad_char', validate_format('my_site.example.com')[2] == 'bad_char')
+check('码: 单标签→no_tld', validate_format('localhost')[2] == 'no_tld')
+check('码: 空标签→empty_label', validate_format('a..com')[2] == 'empty_label')
+check('码: 连字符边界→label_hyphen', validate_format('-bad.example.com')[2] == 'label_hyphen')
+check('码: 数字TLD→tld_bad', validate_format('example.123')[2] == 'tld_bad')
+check('码: 合法域名→None', validate_format('www.example-1.com')[2] is None)
+
 # ---------------- IDN ----------------
 print('== is_idn ==')
 check('punycode识别', is_idn('xn--55qx5d.cn'))

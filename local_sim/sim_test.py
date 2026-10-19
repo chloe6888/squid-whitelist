@@ -587,6 +587,11 @@ def t4_gate(tmp):
           and '疑似仿冒：aliyum.com' in concl('e4') and '已在白名单：github.com' in concl('e4'),
           (st('e4'), concl('e4')))
     check('E2E: 仿冒结论引导联系管理员', '如确认无误请联系管理员' in concl('e4'))
+    check('E2E: 审计保留不合规完整原因(结论只有短语)',
+          ends['e2'].get('invalid') == [['1.2.3.4', '提交的是IP地址，请申请域名']]
+          and '（IP地址）' in concl('e2')
+          and 'aliyum' in str(ends['e4'].get('confirm')),
+          (ends['e2'].get('invalid'), ends['e4'].get('confirm')))
     check('E2E: 执行失败→人工核查', st('e5') == '人工核查', st('e5'))
     check('E2E: 人工核查结论含待开通+转人工',
           '未能开通：fail-x.com、ok-y.com' in concl('e5')

@@ -91,13 +91,24 @@ class DingTalkTable:
         return self._token
 
     def _url(self, path):
-        return ('%s/v1.0/notable/bases/%s/sheets/%s%s?operatorId=%s'
-                % (self.api_base, self.base, self.sheet, path, self.operator))
+        return ('%s/v1.0/notable/bases/%s/sheets/%s%s'
+                % (self.api_base, self.base, self.sheet, path))
+
+    def _request(self, method, path, params=None, json_body=None):
+        """api_base 统一请求出口：operatorId + token 头 + 超时收敛一处。
+
+        params 交 requests urlencode（nextToken 为服务端不透明串，可能含
+        特殊字符，手工拼 query 有截断/注入风险）。响应形态校验留给调用方
+        （fields/records/PUT 各不相同）。"""
+        return requests.request(
+            method, self._url(path),
+            params={'operatorId': self.operator, **(params or {})},
+            json=json_body,
+            headers={'x-acs-dingtalk-access-token': self._get_token()},
+            timeout=self.timeout)
 
     def _load_field_map(self):
-        res = requests.get(url=self._url('/fields'),
-                           headers={'x-acs-dingtalk-access-token': self._get_token()},
-                           timeout=self.timeout)
+        res = self._request('GET', '/fields')
         data = res.json()
         if 'value' not in data:
             hint = ('（operator_id 应为用户 unionId，而非 base/doc ID；'
@@ -122,12 +133,10 @@ class DingTalkTable:
         self.ensure_field_map()
         out, next_token, seen = [], None, set()
         for _page in range(max_pages):
-            url = self._url('/records') + '&maxResults=%d' % page_size
+            params = {'maxResults': page_size}
             if next_token:
-                url += '&nextToken=%s' % next_token
-            res = requests.get(url=url,
-                               headers={'x-acs-dingtalk-access-token': self._get_token()},
-                               timeout=self.timeout)
+                params['nextToken'] = next_token
+            res = self._request('GET', '/records', params=params)
             data = res.json()
             if 'records' not in data:
                 raise RuntimeError('列出记录失败: %s' % res.text)
@@ -181,9 +190,7 @@ class DingTalkTable:
             return True
 
         body = {'records': [{'id': record_id, 'fields': fields}]}
-        res = requests.put(url=self._url('/records'),
-                           headers={'x-acs-dingtalk-access-token': self._get_token()},
-                           json=body, timeout=self.timeout)
+        res = self._request('PUT', '/records', json_body=body)
         if res.status_code != 200:
             raise RuntimeError('回写失败(record=%s) HTTP %s: %s'
                                % (record_id, res.status_code, res.text[:300]))

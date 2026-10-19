@@ -180,50 +180,50 @@ def layer0_check(cfg, mock, audit):
 DNS_REASON = '当前无法解析，若即将上线请稍后重新提交'
 
 
-def _short_invalid_reason(reason):
-    """结论用短原因（完整原因进审计 evidence）。"""
-    if not reason:
-        return '不合规'
-    if reason == DNS_REASON:
-        return DNS_REASON
-    if 'IP地址' in reason:
-        return 'IP地址'
-    if '空格' in reason or '制表符' in reason or '换行' in reason or '回车' in reason:
-        return '含空格'
-    if '端口' in reason:
-        return '含端口'
-    if '用户名' in reason:
-        return '含账号'
-    if '缺少顶级域名后缀' in reason:
-        return '缺少主域名后缀'
-    if '总长度' in reason:
-        return '超长'
-    if '空标签' in reason:
-        return '格式错误'
-    if '顶级域名' in reason:
-        return '顶级域名不合法'
-    if '非法字符' in reason:
-        return '含非法字符'
-    return reason.split('，')[0]
+# 结论用短语映射（码→短语）。完整原因（含具体字符/标签名）只进审计
+# record-end 的 invalid 对——结论面向申请人保持一句话可读，运维排查看审计。
+# 码由 layers.validate_format 返回；idn/dns 两码在分流环节合成。
+REASON_SHORT = {
+    'empty': '域名为空',
+    'too_long': '超长',
+    'colon': '含端口',
+    'userhost': '含账号',
+    'ip': 'IP地址',
+    'whitespace': '含空格',
+    'bad_char': '含非法字符',
+    'no_tld': '缺少主域名后缀',
+    'empty_label': '格式错误',
+    'label_hyphen': '格式错误',
+    'label_bad': '格式错误',
+    'tld_bad': '顶级域名不合法',
+    'idn': '国际化域名暂不支持',
+    'dns': DNS_REASON,          # 本身已是结论级短语
+}
+
+
+def short_reason(code):
+    """码→结论短语（未知码兜底"不合规"：新码忘配映射不会裸抛）。"""
+    return REASON_SHORT.get(code, '不合规')
 
 
 def classify_domains(domains, known_seeds, whitelist_rules):
     """逐域名分流四组（纯内存，零网络探测）。
 
     返回 (invalid, confirm, existing, pending_new)：
-      invalid/confirm 为 [(域名, 结论用原因)]；pending_new 保序。
+      invalid 为 [(域名, 码, 完整原因)]（码→结论短语 short_reason，完整原因
+      进审计）；confirm 为 [(域名, 依据)]；pending_new 保序。
     格式/IDN/相似度逐个判；覆盖与超集吸收统一走 layers.plan_merge
     （对照"白名单+同批待新增"，批内去重/消化，与执行环节同一套语义）。
     """
     invalid, confirm, valid = [], [], []
     reg_seeds = {registrable(r) for r in whitelist_rules if '.' in r}
     for d in domains:
-        ok, reason = validate_format(d)
+        ok, reason, code = validate_format(d)
         if not ok:
-            invalid.append((d, _short_invalid_reason(reason)))
+            invalid.append((d, code, reason))
             continue
         if is_idn(d):
-            invalid.append((d, '国际化域名暂不支持'))
+            invalid.append((d, 'idn', '国际化域名暂不支持'))
             continue
         # 相似度只对照白名单现状（同批其他待新增域名不参与，避免
         # batch-a/batch-b 这类同族域名互相比出"疑似仿冒"）
@@ -237,7 +237,7 @@ def classify_domains(domains, known_seeds, whitelist_rules):
 
 
 def build_conclusion(added, existing, invalid, confirm, extra=()):
-    """四组结论（无该组不出现），面向申请人；技术证据进审计 evidence。
+    """四组结论（无该组不出现），面向申请人；技术证据进审计 record-end。
 
     组名用事实性措辞，不使用与状态列相近的词；状态由状态列单独表达，
     结论不复述状态词（用户确认的格式）。超集冲突已改为自动吸收合并，
@@ -249,7 +249,8 @@ def build_conclusion(added, existing, invalid, confirm, extra=()):
     if existing:
         lines.append('已在白名单：' + '、'.join(existing))
     if invalid:
-        lines.append('域名不合规：' + '、'.join('%s（%s）' % pv for pv in invalid))
+        lines.append('域名不合规：' + '、'.join(
+            '%s（%s）' % (d, short_reason(c)) for d, c, _r in invalid))
     if confirm:
         lines.append('疑似仿冒：' + '、'.join('%s（%s）' % pv for pv in confirm))
     lines.extend(extra)
@@ -270,7 +271,7 @@ def decide_status(added, existing, invalid, confirm, unwritten_note,
         return labels['approved'], ''
     if success and others:
         return labels['partial'], ''
-    if any(r != DNS_REASON for _, r in invalid):
+    if any(c != 'dns' for _, c, _r in invalid):
         return labels['rejected'], '；请修改后重新提交'
     if invalid:
         return labels['rejected'], '；域名无误仅未上线的话，稍后原样重新提交即可'
@@ -317,7 +318,7 @@ def process_record(rec, ctx):
     if ctx.dns_check and pending_new:
         bad = [d for d in pending_new if not resolve_ok(d, timeout=ctx.dns_timeout)]
         if bad:
-            invalid.extend((d, DNS_REASON) for d in bad)
+            invalid.extend((d, 'dns', DNS_REASON) for d in bad)
             pending_new = [d for d in pending_new if d not in bad]
             log.info('DNS无法解析(已归入不合规): %s', '、'.join(bad))
 
@@ -390,8 +391,8 @@ def process_record(rec, ctx):
                 recordId=rid, applicant=flat.get('申请人'),
                 purpose=flat.get('访问用途'), raw=raw, domains=domains,
                 added=added, existing=existing,
-                invalid=[d for d, _ in invalid],
-                confirm=[d for d, _ in confirm],
+                invalid=[[d, r] for d, _c, r in invalid],   # 完整原因进审计
+                confirm=[list(pv) for pv in confirm],
                 status=status_label, conclusion=conclusion,
                 evidence='；'.join(evidence), writeback_ok=write_ok,
                 mock=ctx.mock, elapsed_ms=int((time.time() - t0) * 1000)),

@@ -89,38 +89,42 @@ def split_domains(raw, max_n=20):
 
 
 def validate_format(domain):
-    """格式校验 -> (ok, 原因)。ok=False 时原因可直接写入结论。"""
+    """格式校验 -> (ok, 完整原因, 码)。ok=False 时完整原因进审计，
+    码经主入口 REASON_SHORT 映射为结论短语——两层文案不再靠子串匹配耦合
+    （改措辞不会静默破坏短语映射）。"""
     if not domain:
-        return False, "域名为空"
+        return False, "域名为空", 'empty'
     if len(domain) > 253:
-        return False, "总长度超过253字符"
+        return False, "总长度超过253字符", 'too_long'
     if ':' in domain:
-        return False, "包含端口或IPv6地址，请仅提交域名本体"
+        return False, "包含端口或IPv6地址，请仅提交域名本体", 'colon'
     if '@' in domain:
-        return False, "包含用户名部分(user@host)，请仅提交域名本体"
+        return False, "包含用户名部分(user@host)，请仅提交域名本体", 'userhost'
     # IP 字面量
     parts = domain.split('.')
     if all(p.isdigit() for p in parts if p) and len(parts) == 4:
-        return False, "提交的是IP地址，请申请域名"
+        return False, "提交的是IP地址，请申请域名", 'ip'
     bad = set(domain) - _ASCII_OK
     if bad:
         # 不可见字符渲染成可读名称（空格等直接显示会看不出是什么）
         names = {' ': '空格', '\t': '制表符', '\n': '换行', '\r': '回车'}
+        # 纯空白类字符与其它非法字符分开计码（结论短语分别为 含空格/含非法字符）
+        code = 'whitespace' if bad <= set(names) else 'bad_char'
         return False, "含非法字符，%s" % ','.join(
-            names.get(c, c) for c in sorted(bad))
+            names.get(c, c) for c in sorted(bad)), code
     if len(parts) < 2:
-        return False, "缺少顶级域名后缀（如 .com）"
+        return False, "缺少顶级域名后缀（如 .com）", 'no_tld'
     for p in parts:
         if not p:
-            return False, "存在空标签（连续的点）"
+            return False, "存在空标签（连续的点）", 'empty_label'
         if not _LABEL_RE.match(p):
             if p.startswith('-') or p.endswith('-'):
-                return False, "标签 '%s' 以连字符开头/结尾" % p
-            return False, "标签 '%s' 含非法字符或超长" % p
+                return False, "标签 '%s' 以连字符开头/结尾" % p, 'label_hyphen'
+            return False, "标签 '%s' 含非法字符或超长" % p, 'label_bad'
     tld = parts[-1]
     if tld.isdigit() or len(tld) < 2:
-        return False, "顶级域名 '%s' 不合法" % tld
-    return True, None
+        return False, "顶级域名 '%s' 不合法" % tld, 'tld_bad'
+    return True, None, None
 
 
 def is_idn(domain):
