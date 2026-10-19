@@ -142,6 +142,10 @@ class FakeDingtalk:
                 if u.path.endswith('/records'):
                     if app.fail.get('records'):
                         return self._send(200, {'code': 'mock', 'message': 'records fail'})
+                    if app.fail.get('records_loop'):
+                        # 恒返回同一 nextToken（服务端分页异常注入：测客户端死循环防护）
+                        return self._send(200, {'records': app.records, 'hasMore': True,
+                                                'nextToken': 'LOOP'})
                     size = int(q.get('maxResults', ['100'])[0])
                     cursor = int(q.get('nextToken', ['0'])[0] or 0)
                     page = app.records[cursor:cursor + size]

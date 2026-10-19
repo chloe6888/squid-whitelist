@@ -7,7 +7,8 @@
   T2 token：获取 / 全流程缓存复用 / 过期刷新 / 凭证错误 / 服务端错误
   T3 鉴权头与 URL 组装（base/sheet/operatorId、token 头）
   T4 字段映射：加载 / 缺失字段报错 / 服务端错误
-  T5 读：翻页拼接 / 单页即停 / list_pending 过滤 / 拍平内容 / 接口异常
+  T5 读：翻页拼接 / 单页即停 / list_pending 过滤 / 拍平内容 / 接口异常 /
+        nextToken重复防护 / 页数上限防护
   T6 写：payload 用 fieldId / 单选纯字符串（锁定形态）/ 仅写结论 / 空参数不发请求 /
         自定义结论字段名 / HTTP 错误上抛 / 写后读回生效（自愈闭环）
   T7 调试 CLI（子进程）：--check 冒烟 / --probe-write 联调往返
@@ -188,6 +189,16 @@ def t5_read():
         t = DingTalkTable(cfg_of(srv))
         check('记录接口异常→RuntimeError',
               raises(lambda: t.list_records(), '列出记录失败'))
+    with server() as srv:
+        srv.fail['records_loop'] = 1        # 服务端恒返回同一 nextToken
+        t = DingTalkTable(cfg_of(srv))
+        check('nextToken重复→RuntimeError(死循环防护)',
+              raises(lambda: t.list_records(), 'nextToken重复'))
+    with server(records=[{'id': 'r%d' % i, 'fields': {'状态': '待处理'}}
+                         for i in range(7)]) as srv:
+        t = DingTalkTable(cfg_of(srv))
+        check('超过页数上限→RuntimeError(5000条防护)',
+              raises(lambda: t.list_records(page_size=2, max_pages=3), '分页超过'))
 
 
 def t6_write():

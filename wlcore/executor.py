@@ -142,6 +142,12 @@ class NodeA:
         except FileNotFoundError:
             log.error("白名单文件不存在: %s", self.path)
             return set()
+        except OSError as e:
+            # 权限等读不到与不存在同等对待：按空集只会让记录判"待新增"，
+            # 执行环节自有预检/备份防线兜底；这里不吞异常会打断整轮批处理
+            log.error("白名单文件不可读(权限或IO异常，按空集处理): %s %s",
+                      self.path, e)
+            return set()
 
     def _rule_line(self, domain):
         return ('.' + domain) if self.store_format == 'dot_prefix' else domain

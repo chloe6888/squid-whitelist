@@ -114,11 +114,14 @@ class DingTalkTable:
 
     # ---------------- 读 ----------------
 
-    def list_records(self, page_size=100):
-        """分页拉取全部原始记录。"""
+    def list_records(self, page_size=100, max_pages=50):
+        """分页拉取全部原始记录。
+
+        两重防护：nextToken seen-set（服务端分页异常返回重复游标会死循环）；
+        max_pages 上限（默认 50 页 × 100 条/页 = 5000 条，审批表不会超出）。"""
         self.ensure_field_map()
-        out, next_token = [], None
-        while True:
+        out, next_token, seen = [], None, set()
+        for _page in range(max_pages):
             url = self._url('/records') + '&maxResults=%d' % page_size
             if next_token:
                 url += '&nextToken=%s' % next_token
@@ -132,6 +135,12 @@ class DingTalkTable:
             if not data.get('hasMore') or not data.get('nextToken'):
                 return out
             next_token = data['nextToken']
+            if next_token in seen:
+                raise RuntimeError('nextToken重复(%r)，疑似服务端分页异常，中止'
+                                   % next_token[:40])
+            seen.add(next_token)
+        raise RuntimeError('分页超过%d页(已取%d条)，疑似异常，中止'
+                           % (max_pages, len(out)))
 
     def flatten_record(self, rec):
         """单条记录字段拍平：fieldId→字段名，值→纯文本。"""
