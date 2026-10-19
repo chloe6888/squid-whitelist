@@ -1,0 +1,6 @@
+# 打包（git archive）时剔除开发/测试件——仅影响导出产物，仓库工作区与克隆不受任何影响
+tests/                   export-ignore
+local_sim/               export-ignore
+data/mock_records.json   export-ignore
+.gitignore               export-ignore
+.gitattributes           export-ignore

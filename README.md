@@ -45,7 +45,7 @@
 | [二、功能逻辑](#二功能逻辑) | 2.1 总体流程 · 2.2 状态机 · 2.3 域名处理流水线 · 2.4 主从同步机制 · 2.5 执行事务 |
 | [三、配置说明](#三配置说明configyaml) | config.yaml 逐块说明 |
 | [四、部署指南](#四部署指南) | 4.1 前置条件 → 4.2 主节点部署（代码+定时任务） → 4.3 从节点部署与扩容（含定时任务） → 4.4 生产前检查 |
-| [五、测试与演练](#五测试与演练) | 测试矩阵 + mock 演练命令 |
+| [五、测试与演练](#五测试与演练) | 测试矩阵 + mock 演练命令 + 打包发布 |
 | [六、运维手册](#六运维手册) | 6.1 用户确认闭环 · 6.2 排查速查 · 6.3 人工改动白名单 · 6.4 审计与监控 |
 | [七、已知边界与后续规划](#七已知边界与后续规划) | 当前限制 · 路线图 |
 
@@ -426,6 +426,18 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 | `python3 local_sim/test_dingtalk.py` | 钉钉客户端：token/映射/翻页/多状态过滤/text写入闭环/**nextToken重复与页数上限防护** |
 | `python3 squid_whitelist.py --mock data/mock_records.json` | mock 全路径演练：六态全出口零副作用 |
 | `python3 squid_whitelist.py --dry-run` | 真实数据演练：只判定零写入 |
+
+### 打包发布（git archive）
+
+仓库保留全部文件——tests/ 与 local_sim/ 是回归安全网，**不从仓库删除**。发布包由 `.gitattributes` 的 `export-ignore` 在打包时自动剔除开发件（tests/、local_sim/、`data/mock_records.json`、git 元文件），产物只含生产运行所需（代码 + 种子清单 + scripts + README + requirements）：
+
+```bash
+VER=$(git describe --tags --abbrev=0)      # 如 v1.1
+git archive --format=tar.gz --prefix=squid-whitelist/ \
+    -o /root/dist/squid-whitelist-$VER.tar.gz $VER
+```
+
+部署即 4.2 的 ①（rsync 换解包）：`tar -C /opt -xzf squid-whitelist-$VER.tar.gz` 得到 `/opt/squid-whitelist/`，再 `pip3 install -r requirements.txt`。
 
 ---
 
