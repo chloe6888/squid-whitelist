@@ -121,6 +121,14 @@ def t1_connect(proxy):
     check('非白名单 403+denied+X-Squid-Error',
           r.get('status') == 403 and r.get('denied')
           and 'ERR_ACCESS_DENIED' in (r.get('x_squid_error') or ''), r)
+    # 全拒开关（演练代理全拒场景）：deny_file 存在期间一律 403，移除即恢复
+    Path(proxy.deny_file).write_text('')
+    r = connect_check('example-1.com', '127.0.0.1', proxy.port, timeout=5)
+    check('deny_file存在时白名单域名也403',
+          r.get('status') == 403 and r.get('denied'), r)
+    Path(proxy.deny_file).unlink()
+    r = connect_check('example-1.com', '127.0.0.1', proxy.port, timeout=5)
+    check('deny_file移除后恢复200', r.get('status') == 200, r)
     check('resolve_ok: 本机hosts域名可解析', resolve_ok('localhost', timeout=2, attempts=1))
     check('resolve_ok: 保留TLD不存在域名不可解析',
           not resolve_ok('nx-sim-no-such.invalid', timeout=2, attempts=1))

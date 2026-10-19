@@ -263,8 +263,6 @@ status_pending: "待处理"
 status:
   approved: "已放通"
   rejected: "驳回"
-  no_action: "驳回"
-  already_ok: "已放通"
 api_base: "http://127.0.0.1:%d"
 oapi_base: "http://127.0.0.1:%d"
 """ % (srv.port, srv.port)
