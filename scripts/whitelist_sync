@@ -44,6 +44,7 @@ import os
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -212,6 +213,28 @@ def _backup():
     return bak
 
 
+def _write_tmp(tmp_path, text):
+    """按原文件元数据写同步临时清单（元数据保留，2026-10-19）。
+
+    与主节点 executor._write_tmp 各自实现（自包含原则），一致性由 sim_test
+    契约用例（T6）保证。0o600 显式创建不依赖进程 umask；属主/属组/权限位
+    继承 WHITELIST（flock 单写者，本函数读取无需担心并发）；先 fchown 后
+    fchmod（chown 会清 setuid/setgid 位）；单次 fsync 落盘数据+元数据。
+    非 root 跳过 fchown；失败异常上抛 → sync_once 整体失败保持本地不变。"""
+    st = WHITELIST.stat()
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    f = os.fdopen(fd, 'w', encoding='utf-8')
+    try:
+        f.write(text)
+        f.flush()
+        if os.geteuid() == 0:
+            os.fchown(fd, st.st_uid, st.st_gid)
+        os.fchmod(fd, stat.S_IMODE(st.st_mode))
+        os.fsync(fd)
+    finally:
+        f.close()
+
+
 def sync_once():
     # 最前补偿（锁后）：消除上轮"替换后、reconfigure 完成前"中断的漂移；
     # 必须先于 fetch 与 no-op 比对，否则主端无新变更时永远没有补偿机会
@@ -235,9 +258,8 @@ def sync_once():
     try:
         # 零触盘预检：squid 自己 parse 裁决，正式文件不被碰。
         # 形态原样镜像（裸=精确匹配 / 点前缀=含子域），不静默加宽
-        tmp_wl.write_text(''.join((('.' + d) if remote[d] else d) + '\n'
-                                  for d in sorted(remote)),
-                          encoding='utf-8')
+        _write_tmp(tmp_wl, ''.join((('.' + d) if remote[d] else d) + '\n'
+                                   for d in sorted(remote)))
         err = _write_tmp_conf(tmp_conf, tmp_wl)
         if err:
             log('error', err)

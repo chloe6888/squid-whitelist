@@ -26,6 +26,7 @@ import logging
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -145,6 +146,27 @@ class NodeA:
     def _rule_line(self, domain):
         return ('.' + domain) if self.store_format == 'dot_prefix' else domain
 
+    def _write_tmp(self, tmp_path, text, st):
+        """按原文件元数据写事务临时清单（元数据保留，2026-10-19）。
+
+        0o600 显式创建（权限不由进程 umask 决定）；属主/属组/权限位继承
+        原文件快照 st：先 fchown 后 fchmod（chown 会清 setuid/setgid 位，
+        顺序反了权限位丢失）；单次 fsync 同时落盘数据与元数据，随后由
+        调用方 os.replace。非 root 跳过 fchown（chown 给他人需 CAP_CHOWN，
+        权限位仍保留）。元数据操作不捕获异常——失败在 replace 之前中止，
+        正式文件不被碰。"""
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        f = os.fdopen(fd, 'w', encoding='utf-8')
+        try:
+            f.write(text)
+            f.flush()
+            if os.geteuid() == 0:
+                os.fchown(fd, st.st_uid, st.st_gid)
+            os.fchmod(fd, stat.S_IMODE(st.st_mode))
+            os.fsync(fd)
+        finally:
+            f.close()
+
     # ---- 批量事务 ----
     def add_batch(self, domains):
         """批量原子写入。返回 {'ok','added','skipped','detail','rollback_ok'?,'observe'}
@@ -156,6 +178,9 @@ class NodeA:
         # 单次读取：覆盖判定与行过滤基于同一快照（两读之间人工改动会使
         # absorb 集合与 kept 行过滤错位）
         text = self.path.read_text(encoding='utf-8')
+        # 元数据快照与内容快照同点采集（单次读取原则）：replace 后属主/
+        # 权限继承自此刻的原文件，两读之间人工 chmod 不会导致旧值复活
+        st = self.path.stat()
         rules = parse_whitelist_text(text)
         # 1) 幂等预检 + 批内/超集吸收（执行前对照最新白名单再核一遍；正常
         #    情况下主流程分流时已处理，这里是防线；语义与分流共用 plan_merge）。
@@ -178,9 +203,9 @@ class NodeA:
                     if not ln.strip() or ln.strip().startswith('#')
                     or ln.strip().lower().lstrip('.') not in absorb_bare]
             new_rules = sorted({self._rule_line(d) for d in todo})
-            tmp_wl.write_text(''.join(ln + '\n' for ln in kept)
-                              + ''.join(r + '\n' for r in new_rules),
-                              encoding='utf-8')
+            self._write_tmp(tmp_wl,
+                            ''.join(ln + '\n' for ln in kept)
+                            + ''.join(r + '\n' for r in new_rules), st)
             # 3) 零触盘预检：临时 conf 仅替换 dstdomain 路径，
             #    一切组合冲突由 squid 自己 parse 裁决，正式文件不被碰
             conf_text = self.conf.read_text(encoding='utf-8')

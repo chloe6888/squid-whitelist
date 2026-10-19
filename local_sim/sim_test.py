@@ -18,6 +18,8 @@
      处理中回收 / 两连写顺序 / mock零落盘）
   T5 主节点 pending-reload 补偿（子进程真跑非mock：无标记零调用 /
      补偿成功删标记 / 补偿失败保留 / dry-run 零写入）
+  T6 元数据契约（主NodeA.add_batch / 从whitelist_sync 两实现 × umask ×
+     原权限：替换后属主/属组/权限位保留；回滚后权限位恢复）
 
 用法：python3 local_sim/sim_test.py
 """
@@ -732,6 +734,115 @@ def t5_master_compensate(tmp):
           and 'dry-run' in comp[0]['detail'], comp)
 
 
+# ================================================================ T6
+
+def t6_metadata(tmp):
+    """元数据契约：主从两条写入路径替换后属主/属组/权限位保留（2026-10-19）。
+
+    矩阵 = 实现{主NodeA.add_batch, 从whitelist_sync} × umask{077,022} ×
+    原权限{0640,0644}；属主预设 nobody（root 下才可验；非 root 或无 nobody
+    则跳过属主断言只验权限位）。umask 必须 finally 恢复（进程全局，会波及
+    后续场景）。回滚路径只断言权限位：copy2 备份保留 mode 不保留属主（备份
+    属主=进程用户；生产主从均 root 运行，属主无漂移）。"""
+    import pwd
+    import stat as _stat
+    print('== T6 元数据契约（主从两实现 × umask × 原权限） ==')
+    is_root = os.geteuid() == 0
+    try:
+        _pw = pwd.getpwnam('nobody')
+        uid, gid = _pw.pw_uid, _pw.pw_gid
+    except KeyError:
+        uid, gid = os.geteuid(), os.getegid()
+    can_chown = is_root and (uid, gid) != (os.geteuid(), os.getegid())
+    note = '' if can_chown else '（属主部分已跳过：非root或无nobody）'
+
+    def set_meta(p, mode):
+        os.chmod(p, mode)
+        if can_chown:
+            os.chown(p, uid, gid)
+
+    MATRIX = [(um, md) for um in (0o077, 0o022) for md in (0o640, 0o644)]
+
+    # a) 主节点 add_batch（in-process）：0o600 创建+fchown+fchmod 后替换
+    for um, md in MATRIX:
+        d = tmp / ('meta_a_%o_%o' % (um, md))
+        d.mkdir()
+        wl = d / 'allowed_domains.list'
+        wl.write_text('example-1.com\n')
+        conf = make_conf(d / 'squid.conf', wl)
+        set_meta(wl, md)
+        set_stub_env(d)
+        old = os.umask(um)
+        try:
+            r = NodeA(node_a_cfg(wl, conf), Audit(d / 'audit.jsonl')) \
+                .add_batch(['meta-%o.example' % md])
+        finally:
+            os.umask(old)
+        st = wl.stat()
+        check('主节点 umask=%03o 原%04o: 成功且权限位保留%s' % (um, md, note),
+              r['ok'] and _stat.S_IMODE(st.st_mode) == md,
+              (r.get('detail'), oct(_stat.S_IMODE(st.st_mode))))
+        if can_chown:
+            check('主节点 umask=%03o 原%04o: 属主属组保留' % (um, md),
+                  (st.st_uid, st.st_gid) == (uid, gid),
+                  (st.st_uid, st.st_gid, uid, gid))
+
+    # b) 从节点 whitelist_sync（子进程真跑；umask 进程全局，子进程继承）
+    sync = str(REPO / 'scripts' / 'whitelist_sync')
+    for um, md in MATRIX:
+        d = tmp / ('meta_b_%o_%o' % (um, md))
+        d.mkdir()
+        (d / 'fixture').write_text('.example-1.com\n.meta-site.example\n',
+                                   encoding='utf-8')
+        wl = d / 'allowed_domains.list'
+        wl.write_text('example-1.com\n')
+        conf = make_conf(d / 'squid.conf', wl)
+        set_meta(wl, md)
+        env = stub_env(d)
+        env.update({'WHITELIST': str(wl), 'SQUID_CONF': str(conf),
+                    'SQUID_BIN': STUB, 'SQUID_PORT': str(SIM_PORT),
+                    'BACKUP_KEEP': '5',
+                    'SYNC_FETCH_CMD': 'cat %s' % (d / 'fixture')})
+        old = os.umask(um)
+        try:
+            p = subprocess.run([sys.executable, sync], env=env,
+                               capture_output=True, text=True, timeout=60)
+        finally:
+            os.umask(old)
+        st = wl.stat()
+        check('从节点 umask=%03o 原%04o: 成功且权限位保留%s' % (um, md, note),
+              p.returncode == 0 and ' updated ' in p.stdout
+              and _stat.S_IMODE(st.st_mode) == md,
+              (p.returncode, p.stdout[-120:], oct(_stat.S_IMODE(st.st_mode))))
+        if can_chown:
+            check('从节点 umask=%03o 原%04o: 属主属组保留' % (um, md),
+                  (st.st_uid, st.st_gid) == (uid, gid),
+                  (st.st_uid, st.st_gid, uid, gid))
+
+    # c) 回滚：恢复备份后内容与权限位恢复（属主不断言，理由见 docstring）
+    d = tmp / 'meta_rollback'
+    d.mkdir()
+    (d / 'fixture').write_text('.example-1.com\n.roll-meta.example\n',
+                               encoding='utf-8')
+    wl = d / 'allowed_domains.list'
+    wl.write_text('example-1.com\n')
+    conf = make_conf(d / 'squid.conf', wl)
+    set_meta(wl, 0o640)
+    env = stub_env(d, fail_list='2,3')
+    env.update({'WHITELIST': str(wl), 'SQUID_CONF': str(conf),
+                'SQUID_BIN': STUB, 'SQUID_PORT': str(SIM_PORT),
+                'BACKUP_KEEP': '5', 'SYNC_FETCH_CMD': 'cat %s' % (d / 'fixture')})
+    p = subprocess.run([sys.executable, sync], env=env,
+                       capture_output=True, text=True, timeout=60)
+    st = wl.stat()
+    check('回滚: 内容与权限位恢复(0640)',
+          p.returncode == 1 and 'failed' in p.stdout
+          and wl.read_text() == 'example-1.com\n'
+          and _stat.S_IMODE(st.st_mode) == 0o640,
+          (p.returncode, p.stdout[-120:], repr(wl.read_text()),
+           oct(_stat.S_IMODE(st.st_mode))))
+
+
 _PROXY = None
 
 
@@ -751,6 +862,7 @@ def main():
         t3_whitelist_sync(tmp)
         t4_gate(tmp)
         t5_master_compensate(tmp)
+        t6_metadata(tmp)
     finally:
         _PROXY.stop()
         print('\n清理临时目录: %s' % tmp)

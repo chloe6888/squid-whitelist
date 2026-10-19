@@ -241,7 +241,7 @@ cron 触发（*/1，flock 防重叠）
   │                                        不等 ↓
   │                                     ④ 零触盘预检：tmp清单+tmp.conf → squid -f tmp -k parse
   │                                        失败 → 拒绝落地（本地保持最后good版本）
-  │                                     ⑤ 写 pending-reload 标记 → 备份 → 原子替换
+  │                                     ⑤ 写 pending-reload 标记 → 备份 → 原子替换（元数据保留）
   │                                        → squid -k reconfigure + 等端口 → 删标记
   │                                        失败 → 恢复备份（回滚后 reconfigure 成功才删标记）
   │                                     ⑥ 日志一行（updated +N -M / 失败原因）
@@ -289,6 +289,7 @@ CONNECT 复测：逐域名一次，纯观察项
 ```
 
 - **写入形态**：`store_format: dot_prefix`（`.example.com`）。squid 6.14 实测：裸条目仅精确匹配，点前缀才覆盖裸域+全部子域
+- **元数据保留（2026-10-19）**：临时清单 `0o600` 显式创建（权限不由进程 umask 决定），属主/属组/权限位继承原文件（先 fchown 后 fchmod——chown 会清 setuid/sgid 位，顺序不能反），单次 fsync 同时落盘数据+元数据后原子替换——**替换前后文件属主/权限零漂移**（squid 以 root 读 ACL 文件时非 root 属主/收紧权限是隐患）。从节点 sync 同样实现：自包含不共用代码，一致性由契约测试锁定（主从两实现 × umask{077,022} × 原权限{0640,0644}，属主 nobody；非 root 环境自动降级只验权限位）
 - **pending-reload 补偿（2026-10-19）**：替换后、reconfigure 完成前进程死亡，磁盘清单与运行配置漂移且**永不自愈**（表格已回写"已放通"而代理仍拒绝；从节点 no-op 提前退出挡死补偿）。主从事务均以标记包夹该窗口（事务序：写标记并 fsync → 备份 → 替换 → reconfigure → 等端口就绪 → 删标记）。主节点每轮层0之前、从节点每轮 sync 最前（fetch 之前）检查标记补一次 reconfigure。**删标记判据=reconfigure rc==0**——等端口就绪仅 best-effort 不参与判据，否则端口配置不符的节点会陷入每轮补偿循环；标记写失败在替换之前中止事务；补偿失败保留标记下轮重试、不中断本轮；dry-run 只报告不补偿（零写入）；mock 演练不触盘天然无标记
 - **回滚条件只剩两个**：预检/parse 失败、reconfigure 失败——均与目标站点、出口 IP、网络状况完全无关
 - **超集自动吸收**：申请 `example.com` 而白名单已有 `www.example.com` 时，squid 6.14 拒载“子域+超集并存”（FATAL `X is a subdomain of .Y`）——同事务内新增 `.example.com` 并剔除其覆盖的子域条目（超集完整覆盖子域的匹配范围，替换零风险、无需人工处理）；同批既有超集又有其子域时只写超集
@@ -415,7 +416,7 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 | 命令 | 覆盖内容 |
 |---|---|
 | `python3 tests/test_layers.py` | 拆分（容错/Markdown/端口/去重/截断）、格式、IDN、相似度（含短域相对阈值）、覆盖方向性、合并计划 plan_merge（覆盖/批内/超集吸收）、清单文件加载 |
-| `python3 local_sim/sim_test.py` | 全链路：批量事务（成功/预检零触盘/回滚/超集吸收/批内吸收）、pending-reload（标记写失败中止/回滚成败删标记/**崩溃注入(替换后reconfigure前被杀)下轮补偿**/补偿失败重试/主从两侧/dry-run 零写入）、DNS 准入 E2E、whitelist_sync 子进程真跑（no-op/更新/拒收/master不可达/**形态保真不加点加宽**/**flock 防重叠**/selftest）、serve 输出保真、E2E 多域名六态全出口、处理中回收 |
+| `python3 local_sim/sim_test.py` | 全链路：批量事务（成功/预检零触盘/回滚/超集吸收/批内吸收）、pending-reload（标记写失败中止/回滚成败删标记/**崩溃注入(替换后reconfigure前被杀)下轮补偿**/补偿失败重试/主从两侧/dry-run 零写入）、**元数据契约（主从两实现 × umask × 原权限：替换后属主/权限保留，回滚权限恢复）**、DNS 准入 E2E、whitelist_sync 子进程真跑（no-op/更新/拒收/master不可达/**形态保真不加点加宽**/**flock 防重叠**/selftest）、serve 输出保真、E2E 多域名六态全出口、处理中回收 |
 | `python3 local_sim/test_dingtalk.py` | 钉钉客户端：token/映射/翻页/多状态过滤/text写入闭环 |
 | `python3 squid_whitelist.py --mock data/mock_records.json` | mock 全路径演练：六态全出口零副作用 |
 | `python3 squid_whitelist.py --dry-run` | 真实数据演练：只判定零写入 |
