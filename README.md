@@ -432,12 +432,12 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 仓库保留全部文件——tests/ 与 local_sim/ 是回归安全网，**不从仓库删除**。发布包由 `.gitattributes` 的 `export-ignore` 在打包时自动剔除开发件（tests/、local_sim/、`data/mock_records.json`、git 元文件），产物只含生产运行所需（代码 + 种子清单 + scripts + README + requirements）：
 
 ```bash
-VER=$(git describe --tags --abbrev=0)      # 如 v1.1
+VER=$(git describe --tags --abbrev=0)      # 如 squid-whitelist-v1.1
 git archive --format=tar.gz --prefix=squid-whitelist/ \
-    -o /root/dist/squid-whitelist-$VER.tar.gz $VER
+    -o /root/dist/$VER.tar.gz $VER
 ```
 
-部署即 4.2 的 ①（rsync 换解包）：`tar -C /opt -xzf squid-whitelist-$VER.tar.gz` 得到 `/opt/squid-whitelist/`，再 `pip3 install -r requirements.txt`。
+部署即 4.2 的 ①（rsync 换解包）：`tar -C /opt -xzf $VER.tar.gz` 得到 `/opt/squid-whitelist/`，再 `pip3 install -r requirements.txt`。
 
 ---
 
