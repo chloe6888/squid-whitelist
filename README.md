@@ -294,6 +294,7 @@ CONNECT 复测：逐域名一次，纯观察项
 - **回滚条件只剩两个**：预检/parse 失败、reconfigure 失败——均与目标站点、出口 IP、网络状况完全无关
 - **超集自动吸收**：申请 `example.com` 而白名单已有 `www.example.com` 时，squid 6.14 拒载“子域+超集并存”（FATAL `X is a subdomain of .Y`）——同事务内新增 `.example.com` 并剔除其覆盖的子域条目（超集完整覆盖子域的匹配范围，替换零风险、无需人工处理）；同批既有超集又有其子域时只写超集
 - **审计**：recordId、申请人、每个域名的分流结果与原因、事务各步（含被吸收条目）、复测观察值、回写结果
+- **凭证脱敏（2026-10-19）**：appkey/appsecret/代理口令/在用 token 在审计与心跳落盘前统一抹除为 `***`（网络异常消息会带出完整 gettoken URL，query 里就是凭证——审计/心跳不能成为二次泄漏点）；拉取失败的控制台日志同步打码；`--check` 的 token 打印收敛为前 8 位
 
 ---
 
@@ -416,7 +417,7 @@ ssh root@<新节点> 'ssh-keyscan -t ed25519 <A地址> | ssh-keygen -lf -   # �
 | 命令 | 覆盖内容 |
 |---|---|
 | `python3 tests/test_layers.py` | 拆分（容错/Markdown/端口/去重/截断）、格式、IDN、相似度（含短域相对阈值）、覆盖方向性、合并计划 plan_merge（覆盖/批内/超集吸收）、清单文件加载 |
-| `python3 local_sim/sim_test.py` | 全链路：批量事务（成功/预检零触盘/回滚/超集吸收/批内吸收）、pending-reload（标记写失败中止/回滚成败删标记/**崩溃注入(替换后reconfigure前被杀)下轮补偿**/补偿失败重试/主从两侧/dry-run 零写入）、**元数据契约（主从两实现 × umask × 原权限：替换后属主/权限保留，回滚权限恢复）**、DNS 准入 E2E、whitelist_sync 子进程真跑（no-op/更新/拒收/master不可达/**形态保真不加点加宽**/**flock 防重叠**/selftest）、serve 输出保真、E2E 多域名六态全出口、处理中回收 |
+| `python3 local_sim/sim_test.py` | 全链路：批量事务（成功/预检零触盘/回滚/超集吸收/批内吸收）、pending-reload（标记写失败中止/回滚成败删标记/**崩溃注入(替换后reconfigure前被杀)下轮补偿**/补偿失败重试/主从两侧/dry-run 零写入）、**元数据契约（主从两实现 × umask × 原权限：替换后属主/权限保留，回滚权限恢复）**、**凭证脱敏（fetch 失败时 appkey/appsecret 不落审计/心跳/日志）**、DNS 准入 E2E、whitelist_sync 子进程真跑（no-op/更新/拒收/master不可达/**形态保真不加点加宽**/**flock 防重叠**/selftest）、serve 输出保真、E2E 多域名六态全出口、处理中回收 |
 | `python3 local_sim/test_dingtalk.py` | 钉钉客户端：token/映射/翻页/多状态过滤/text写入闭环 |
 | `python3 squid_whitelist.py --mock data/mock_records.json` | mock 全路径演练：六态全出口零副作用 |
 | `python3 squid_whitelist.py --dry-run` | 真实数据演练：只判定零写入 |

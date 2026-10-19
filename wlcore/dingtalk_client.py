@@ -68,6 +68,15 @@ class DingTalkTable:
 
     # ---------------- 基础 ----------------
 
+    def redaction_values(self):
+        """日志脱敏用：凭证与在用 access_token（主入口 Audit/心跳集中抹除）。
+
+        gettoken 把 appkey/appsecret 拼在 URL query，网络异常消息会带出
+        完整 URL——这些值不得落审计/心跳/日志。"""
+        return [str(v) for v in (self.cfg.get('app_key'),
+                                 self.cfg.get('app_secret'),
+                                 self._token) if v]
+
     def _get_token(self):
         now = time.time()
         if self._token and now - self._token_ts < 7000:   # 有效期7200s，提前刷新
@@ -251,7 +260,7 @@ def _cmd_check(dt_cfg, probe_write=None):
     status_field = table.status_field
 
     print('[1] 获取 token ...')
-    print('    access_token: %s' % table._get_token()[:16])
+    print('    access_token: %s...（已打码）' % table._get_token()[:8])
 
     print('[2] 加载字段映射 ...')
     table.ensure_field_map()

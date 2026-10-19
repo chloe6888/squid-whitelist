@@ -39,6 +39,46 @@ from wlcore.executor import NodeA
 log = logging.getLogger("squid_whitelist")
 
 
+# ================================================================ 凭证脱敏
+
+def collect_secrets(cfg, table=None):
+    """不得出现在日志/审计/心跳中的敏感值：钉钉 appkey/appsecret（gettoken
+    把它们拼在 URL query 里，网络异常消息会带完整 URL）、代理认证口令、
+    在用 access_token。过短值（<4字符）不参与抹除，避免把 'x' 这类
+    占位符当敏感词全局误替换。"""
+    vals = []
+    dt = cfg.get('dingtalk') or {}
+    for k in ('app_key', 'app_secret'):
+        if dt.get(k):
+            vals.append(str(dt[k]))
+    pa = (cfg.get('execution') or {}).get('proxy_auth')
+    if pa:
+        vals.append(str(pa))
+    if table is not None and hasattr(table, 'redaction_values'):
+        vals += [str(v) for v in table.redaction_values()]
+    return [v for v in vals if len(v) >= 4]
+
+
+def redact_secrets(text, secrets):
+    """把文本中的敏感值替换为 ***（日志/心跳等输出点用）。"""
+    for s in secrets or ():
+        text = text.replace(s, '***')
+    return text
+
+
+def _redact_obj(obj, secrets):
+    """递归抹除 dict/list/字符串值中的敏感值（审计行/心跳 payload 用）。"""
+    if not secrets:
+        return obj
+    if isinstance(obj, str):
+        return redact_secrets(obj, secrets)
+    if isinstance(obj, dict):
+        return {k: _redact_obj(v, secrets) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_redact_obj(v, secrets) for v in obj]
+    return obj
+
+
 # ================================================================ 审计
 
 class Audit:
@@ -46,18 +86,24 @@ class Audit:
 
     超过 max_mb 自动轮转：audit.jsonl -> audit.jsonl.rot.<ts>，保留最近
     keep 份（cron 长期运行无界增长会拖垮磁盘；主进程 flock 单实例，
-    rename 原子无并发问题）。"""
+    rename 原子无并发问题）。
 
-    def __init__(self, path, max_mb=16, keep=3):
+    凭证脱敏（2026-10-19）：写入前对行内字符串值统一抹除 secrets
+    （appkey/appsecret/代理口令/token → ***）——网络异常消息含完整
+    URL，审计不能成为二次泄漏点。"""
+
+    def __init__(self, path, max_mb=16, keep=3, secrets=()):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.max_bytes = int(max_mb) * 1024 * 1024
         self.keep = int(keep)
+        self.secrets = list(secrets)
 
     def event(self, event, **kw):
         self._rotate()
         line = {'ts': datetime.now().isoformat(timespec='seconds'), 'event': event}
         line.update(kw)
+        line = _redact_obj(line, self.secrets)
         try:
             with self.path.open('a', encoding='utf-8') as f:
                 f.write(json.dumps(line, ensure_ascii=False) + '\n')
@@ -378,10 +424,12 @@ def acquire_lock(path):
         return None
 
 
-def write_heartbeat(path, payload):
+def write_heartbeat(path, payload, secrets=()):
+    """心跳原子性无要求（纯提示文件），但与审计同一套脱敏。"""
     try:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+        Path(path).write_text(json.dumps(_redact_obj(payload, secrets),
+                                         ensure_ascii=False), encoding='utf-8')
     except OSError as e:
         log.error('心跳写入失败: %s', e)
 
@@ -438,6 +486,9 @@ def main():
         from wlcore.dingtalk_client import DingTalkTable
         table = DingTalkTable(cfg['dingtalk'])
 
+    # 脱敏集合在组件装配后补挂（Audit 构造先于 table；mock 表无凭证）
+    audit.secrets = collect_secrets(cfg, table)
+
     # ---- pending-reload 补偿（层0之前）----
     # 上轮事务可能在"替换后、reconfigure 完成前"中断，磁盘清单与运行配置
     # 漂移且不会自愈：先补一次 reconfigure 对齐再干活。mock 演练不触盘
@@ -456,18 +507,21 @@ def main():
         log.error('层0预检失败，整批跳过（记录原地不动）：%s', reason)
         write_heartbeat(paths.get('heartbeat', 'data/heartbeat'),
                         {'ts': datetime.now().isoformat(timespec='seconds'),
-                         'result': 'layer0-failed', 'reason': reason})
+                         'result': 'layer0-failed', 'reason': reason},
+                        secrets=audit.secrets)
         return 0
 
     # ---- 拉取 待处理 + 处理中（上轮中断回收：写入幂等，重跑无副作用） ----
     try:
         records = table.list_pending([labels['pending'], labels['processing']])
     except Exception as e:
-        log.error('拉取待处理记录失败: %s', e)
-        audit.event('fetch-failed', error=str(e))
+        # 异常消息可能含完整 gettoken URL（query 里是 appkey/appsecret）
+        log.error('拉取待处理记录失败: %s', redact_secrets(str(e), audit.secrets))
+        audit.event('fetch-failed', error=str(e))   # Audit 落盘前统一抹除
         write_heartbeat(paths.get('heartbeat', 'data/heartbeat'),
                         {'ts': datetime.now().isoformat(timespec='seconds'),
-                         'result': 'fetch-failed', 'reason': str(e)})
+                         'result': 'fetch-failed', 'reason': str(e)},
+                        secrets=audit.secrets)
         return 1
 
     lay = cfg.get('layers', {})
@@ -496,7 +550,8 @@ def main():
     audit.event('run-end', total=len(records), counts=counts)
     write_heartbeat(paths.get('heartbeat', 'data/heartbeat'),
                     {'ts': datetime.now().isoformat(timespec='seconds'),
-                     'result': 'ok', 'total': len(records), 'counts': counts})
+                     'result': 'ok', 'total': len(records), 'counts': counts},
+                    secrets=audit.secrets)
     log.info('本轮完成: %s', json.dumps(counts, ensure_ascii=False))
     return 0
 

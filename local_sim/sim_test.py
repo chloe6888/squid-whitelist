@@ -20,6 +20,8 @@
      补偿成功删标记 / 补偿失败保留 / dry-run 零写入）
   T6 元数据契约（主NodeA.add_batch / 从whitelist_sync 两实现 × umask ×
      原权限：替换后属主/属组/权限位保留；回滚后权限位恢复）
+  T7 凭证脱敏（fetch 失败：异常消息含完整 gettoken URL，审计/心跳/日志
+     中 appkey/appsecret 抹除为 ***）
 
 用法：python3 local_sim/sim_test.py
 """
@@ -455,8 +457,8 @@ def t3_whitelist_sync(tmp):
 def write_sim_config(tmp, wl_abs, known_abs, dns_check=False, dt_api_base=None):
     conf = make_conf(tmp / 'squid.conf', wl_abs)
     cfg = """dingtalk:
-  app_key: x
-  app_secret: x
+  app_key: sim-appkey-0123456789
+  app_secret: sim-appsecret-0123456789
   base_id: x
   sheet_id: x
   operator_id: x%s
@@ -482,7 +484,8 @@ paths:
   audit_log: %s
   heartbeat: %s
   lock_file: %s
-""" % (('\n  api_base: %s' % dt_api_base) if dt_api_base else '',
+""" % (('\n  api_base: %s\n  oapi_base: %s' % (dt_api_base, dt_api_base))
+          if dt_api_base else '',
        SIM_PORT, conf, wl_abs, 'true' if dns_check else 'false', STUB, known_abs,
        tmp / 'audit.jsonl', tmp / 'heartbeat', tmp / 'lock')
     p = tmp / 'sim.yaml'
@@ -663,8 +666,8 @@ def t4_gate(tmp):
 def t5_master_compensate(tmp):
     """主节点 pending-reload 补偿（子进程真跑，非 mock）。
 
-    钉钉 api_base 指向关闭端口 → 拉取必败（rc=1），但补偿在拉取之前执行，
-    恰好隔离验证补偿环节本身。"""
+    钉钉 api/oapi base 指向关闭端口 → 拉取必败（rc=1），但补偿在拉取之前
+    执行，恰好隔离验证补偿环节本身。"""
     print('== T5 主节点 pending-reload 补偿（子进程真跑，非mock） ==')
 
     def setup(name):
@@ -843,6 +846,35 @@ def t6_metadata(tmp):
            oct(_stat.S_IMODE(st.st_mode))))
 
 
+# ================================================================ T7
+
+def t7_secret_redaction(tmp):
+    """凭证脱敏：gettoken 网络异常消息含完整 URL（query 里是 appkey/
+    appsecret），审计/心跳/控制台日志三处输出点都必须抹除为 ***。"""
+    print('== T7 凭证脱敏（fetch 失败 → 审计/心跳/日志抹除） ==')
+    d = tmp / 'redact'
+    d.mkdir()
+    wl = d / 'allowed_domains.list'
+    wl.write_text('.example-1.com\n')
+    (d / 'known.txt').write_text('aliyun.com\n', encoding='utf-8')
+    cfg = write_sim_config(d, wl, d / 'known.txt', dt_api_base='http://127.0.0.1:9')
+    p = subprocess.run([sys.executable, str(REPO / 'squid_whitelist.py'),
+                        '--config', str(cfg)], capture_output=True, text=True,
+                       timeout=120)
+    check('脱敏: 拉取失败rc=1', p.returncode == 1, p.returncode)
+    hb = (d / 'heartbeat').read_text(encoding='utf-8')
+    at = (d / 'audit.jsonl').read_text(encoding='utf-8')
+    check('脱敏: 心跳无appkey/appsecret且含***',
+          'sim-appkey-0123456789' not in hb
+          and 'sim-appsecret-0123456789' not in hb and '***' in hb, hb)
+    check('脱敏: 审计无appkey/appsecret且含***',
+          'sim-appkey-0123456789' not in at
+          and 'sim-appsecret-0123456789' not in at and '***' in at, at[:300])
+    check('脱敏: 控制台日志无appkey/appsecret',
+          'sim-appkey-0123456789' not in p.stderr
+          and 'sim-appsecret-0123456789' not in p.stderr, p.stderr[-300:])
+
+
 _PROXY = None
 
 
@@ -863,6 +895,7 @@ def main():
         t4_gate(tmp)
         t5_master_compensate(tmp)
         t6_metadata(tmp)
+        t7_secret_redaction(tmp)
     finally:
         _PROXY.stop()
         print('\n清理临时目录: %s' % tmp)
